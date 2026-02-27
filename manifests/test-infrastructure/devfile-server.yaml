@@ -1,0 +1,133 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devfile-server
+  namespace: ${NAMESPACE}
+  labels:
+    app: devfile-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: devfile-server
+  template:
+    metadata:
+      labels:
+        app: devfile-server
+    spec:
+      containers:
+      - name: server
+        image: ${DEVFILE_SERVER_IMAGE}
+        env:
+        - name: EXTERNAL_DEVFILE_URL
+          value: "${DEVFILE_URL}"
+        command:
+          - sh
+          - -c
+          - |
+            apk add --no-cache curl >/dev/null 2>&1 || true
+
+            # Use /tmp for writable directory (OpenShift security constraints)
+            mkdir -p /tmp/devfiles/nodejs /tmp/devfiles/python /tmp/devfiles/external
+
+            # Copy devfiles from ConfigMaps
+            cp /config/nodejs/devfile.yaml /tmp/devfiles/nodejs/devfile.yaml
+            cp /config/python/devfile.yaml /tmp/devfiles/python/devfile.yaml
+
+            # Optionally fetch and mirror an external devfile
+            if [ -n "$${EXTERNAL_DEVFILE_URL:-}" ]; then
+              echo "Fetching external devfile: $${EXTERNAL_DEVFILE_URL}"
+              if curl -fsSL "$${EXTERNAL_DEVFILE_URL}" -o /tmp/devfiles/external/devfile.yaml; then
+                echo "✓ External devfile mirrored"
+              else
+                echo "⚠ Could not fetch external devfile (will keep sample devfiles only)"
+              fi
+            fi
+
+            # Create index.json (include external devfile if present)
+            python3 - <<'PY'
+            import json, os
+            items = [
+              {
+                "name": "nodejs-hello-world",
+                "displayName": "Node.js Hello World",
+                "description": "Simple Node.js application for IPv6 testing",
+                "type": "stack",
+                "tags": ["NodeJS", "Express", "IPv6"],
+                "url": "/nodejs/devfile.yaml",
+              },
+              {
+                "name": "python-hello-world",
+                "displayName": "Python Hello World",
+                "description": "Simple Python application for IPv6 testing",
+                "type": "stack",
+                "tags": ["Python", "Flask", "IPv6"],
+                "url": "/python/devfile.yaml",
+              },
+            ]
+            if os.path.exists("/tmp/devfiles/external/devfile.yaml"):
+              items.append({
+                "name": "external-devfile",
+                "displayName": "External Devfile (mirrored)",
+                "description": "Devfile fetched from EXTERNAL_DEVFILE_URL and served over IPv6",
+                "type": "stack",
+                "tags": ["External", "IPv6"],
+                "url": "/external/devfile.yaml",
+              })
+            with open("/tmp/devfiles/index.json", "w") as f:
+              json.dump(items, f, indent=2)
+            PY
+
+            # Start HTTP server on all interfaces (:: for IPv4 and IPv6)
+            cd /tmp/devfiles
+            echo "Starting devfile HTTP server on port 8080..."
+            python3 -m http.server 8080 --bind ::
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - name: nodejs-devfile
+          mountPath: /config/nodejs
+        - name: python-devfile
+          mountPath: /config/python
+        resources:
+          limits:
+            memory: 128Mi
+          requests:
+            memory: 64Mi
+      volumes:
+      - name: nodejs-devfile
+        configMap:
+          name: nodejs-devfile
+      - name: python-devfile
+        configMap:
+          name: python-devfile
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devfile-server
+  namespace: ${NAMESPACE}
+  labels:
+    app: devfile-server
+spec:
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+    - IPv6
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: devfile-server

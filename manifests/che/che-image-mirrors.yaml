@@ -1,0 +1,29 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# ImageTagMirrorSet - redirects quay.io/eclipse and quay.io/devfile to local registry.
+# Apply when mirror script has pushed images but ICSP from mirror hasn't been applied yet.
+# Requires: virthost.ostest.test.metalkube.org:5000 to have eclipse-che/eclipse and eclipse-che/devfile.
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: che-eclipse-mirror
+spec:
+  imageTagMirrors:
+  - source: quay.io/eclipse
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che/eclipse
+  - source: quay.io/devfile
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che/devfile
+  - source: quay.io/che-incubator
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che/che-incubator
+  - source: quay.io/openshift
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che/openshift
