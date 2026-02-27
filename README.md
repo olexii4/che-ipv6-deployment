@@ -201,16 +201,6 @@ The dashboard serves these sample files at `/public/dashboard/devfile-registry/a
 - `*-devfile.yaml` — devfiles (e.g. `python-hello-world-devfile.yaml`, `web-nodejs-sample-devfile.yaml`, `php-hello-world-devfile.yaml`, `dotnet-web-simple-devfile.yaml`, `golang-health-check-devfile.yaml`, `lombok-project-sample-devfile.yaml`, `ansible-devspaces-demo-devfile.yaml`)
 - `*.zip` — project archives
 
-### Factory URL Testing
-
-```bash
-# Test factory URL with IPv6 repository
-https://che-host/#http://[fd00::1]:8080/repo.git
-
-# Test with devfile
-https://che-host/#http://[fd00::1]:8080/repo.git?df=devfile.yaml
-```
-
 ### Test with Air-Gap Samples
 
 Air-gap samples are served by the dashboard and work without network access. Use the Getting Started page to create workspaces.
@@ -290,22 +280,9 @@ Port-forward access does not work for Che login due to OAuth redirect URI mismat
 
 ## Expected Results
 
-- ✅ Dashboard correctly parses IPv6 URLs with square brackets
-- ✅ Factory flow creates workspace from IPv6 repository URLs
-- ✅ Git clone works over IPv6 network
-- ✅ Workspace starts successfully with IPv6-hosted devfiles
-- ✅ No URL validation errors for RFC-compliant IPv6 URLs
-
-## Manual Testing
-
-After deployment, you can manually test IPv6 URLs:
-
-1. Access the Che dashboard using HTTP proxy (Chrome with --proxy-server flag)
-2. Navigate to factory URL:
-   ```
-   https://<che-host>/#http://[fd00::1]:8080/your-repo.git
-   ```
-3. Verify workspace creation succeeds
+- ✅ Deployment succeeds; Che dashboard and che-server are ready
+- ✅ Air-gap samples work via Getting Started (no external network required)
+- ✅ Dashboard serves samples at `/dashboard/api/airgap-sample/*`
 
 ## License
 

@@ -1,0 +1,87 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# Che server Deployment for manual provisioning when operator fails.
+# Used by provision-che-server-manually.sh. Variables: NAMESPACE, CHE_IMAGE
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: che
+  namespace: ${NAMESPACE}
+  labels:
+    app: che
+    app.kubernetes.io/component: che
+    app.kubernetes.io/instance: che
+    app.kubernetes.io/managed-by: che-operator
+    app.kubernetes.io/name: che
+    app.kubernetes.io/part-of: che.eclipse.org
+    component: che
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: che
+      component: che
+  template:
+    metadata:
+      labels:
+        app: che
+        app.kubernetes.io/component: che
+        app.kubernetes.io/instance: che
+        app.kubernetes.io/managed-by: che-operator
+        app.kubernetes.io/name: che
+        app.kubernetes.io/part-of: che.eclipse.org
+        component: che
+    spec:
+      serviceAccountName: che
+      volumes:
+      - name: che-public-certs
+        configMap:
+          name: ca-certs-merged
+      - name: che-self-signed-cert
+        secret:
+          secretName: self-signed-certificate
+      containers:
+      - name: che-server
+        image: ${CHE_IMAGE}
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: http-debug
+          containerPort: 8000
+        - name: jgroups-ping
+          containerPort: 8888
+        env:
+        - name: KUBERNETES_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: CHE_AUTH_NATIVEUSER
+          value: "true"
+        envFrom:
+        - configMapRef:
+            name: che
+        volumeMounts:
+        - name: che-public-certs
+          mountPath: /public-certs
+        - name: che-self-signed-cert
+          mountPath: /self-signed-cert
+        readinessProbe:
+          httpGet:
+            path: /api/system/state
+            port: 8080
+          initialDelaySeconds: 25
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/system/state
+            port: 8080
+          initialDelaySeconds: 140
+          periodSeconds: 15

@@ -946,71 +946,11 @@ echo -e "${YELLOW}Step 4: Creating mirror configuration (tag + digest)${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
 
 # Prefer ImageTagMirrorSet / ImageDigestMirrorSet (OCP 4.12+), keep ICSP for backward compatibility.
-cat > /tmp/che-tag-mirrors.yaml <<EOF
-apiVersion: config.openshift.io/v1
-kind: ImageTagMirrorSet
-metadata:
-  name: che-tag-mirrors
-spec:
-  imageTagMirrors:
-  - source: quay.io/eclipse
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/eclipse
-  - source: quay.io/oorel
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/oorel
-  - source: quay.io/che-incubator
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/che-incubator
-  - source: quay.io/jetstack
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/jetstack
-  - source: quay.io/devfile
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/devfile
-  - source: quay.io/openshift
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/openshift
-  - source: docker.io/library
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/library
-  - source: docker.io/alpine
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/alpine
-EOF
-
-cat > /tmp/che-digest-mirrors.yaml <<EOF
-apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: che-digest-mirrors
-spec:
-  imageDigestMirrors:
-  - source: quay.io/eclipse
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/eclipse
-  - source: quay.io/oorel
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/oorel
-  - source: quay.io/che-incubator
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/che-incubator
-  - source: quay.io/jetstack
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/jetstack
-  - source: quay.io/devfile
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/devfile
-  - source: quay.io/openshift
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/openshift
-  - source: docker.io/library
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/library
-  - source: docker.io/alpine
-    mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/alpine
-EOF
+MANIFEST_DIR="${REPO_DIR}/manifests/che"
+sed -e "s|\${LOCAL_REGISTRY}|${LOCAL_REGISTRY}|g" \
+  "${MANIFEST_DIR}/che-image-tag-mirrors.yaml" > /tmp/che-tag-mirrors.yaml
+sed -e "s|\${LOCAL_REGISTRY}|${LOCAL_REGISTRY}|g" \
+  "${MANIFEST_DIR}/che-image-digest-mirrors.yaml" > /tmp/che-digest-mirrors.yaml
 
 echo "Created ImageTagMirrorSet: /tmp/che-tag-mirrors.yaml"
 echo "Created ImageDigestMirrorSet: /tmp/che-digest-mirrors.yaml"
@@ -1025,48 +965,8 @@ echo ""
 echo -e "${YELLOW}Creating ImageContentSourcePolicy (compat) ...${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
 
-cat > /tmp/che-image-policy.yaml <<EOF
-apiVersion: operator.openshift.io/v1alpha1
-kind: ImageContentSourcePolicy
-metadata:
-  name: che-images
-spec:
-  repositoryDigestMirrors:
-  # Eclipse Che images
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/eclipse
-    source: quay.io/eclipse
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/oorel
-    source: quay.io/oorel
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/che-incubator
-    source: quay.io/che-incubator
-
-  # Cert-manager images
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/jetstack
-    source: quay.io/jetstack
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/openshift
-    source: quay.io/openshift
-EOF
-
-cat >> /tmp/che-image-policy.yaml <<EOF
-
-  # DevWorkspace images (required for workspace creation + OLM catalogs/bundles)
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/devfile
-    source: quay.io/devfile
-
-  # Docker Hub images
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/library
-    source: docker.io/library
-  - mirrors:
-    - ${LOCAL_REGISTRY}/eclipse-che/alpine
-    source: docker.io/alpine
-EOF
+sed -e "s|\${LOCAL_REGISTRY}|${LOCAL_REGISTRY}|g" \
+  "${MANIFEST_DIR}/che-image-content-source-policy.yaml" > /tmp/che-image-policy.yaml
 
 echo "Created ImageContentSourcePolicy:"
 cat /tmp/che-image-policy.yaml

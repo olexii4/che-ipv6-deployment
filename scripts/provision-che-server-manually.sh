@@ -83,86 +83,10 @@ oc create configmap che -n "$NS" --from-literal="CHE_HOST=${CHE_HOST}" \
     --from-literal="CHE_AUTH_NATIVEUSER=true" \
     --dry-run=client -o yaml | oc apply -f -
 
-# Create che (che-server) Deployment
+# Create che (che-server) Deployment from manifest
 CHE_IMAGE="${REGISTRY}/eclipse-che/eclipse/che-server:${SERVER_IMAGE}"
-oc apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: che
-  namespace: ${NS}
-  labels:
-    app: che
-    app.kubernetes.io/component: che
-    app.kubernetes.io/instance: che
-    app.kubernetes.io/managed-by: che-operator
-    app.kubernetes.io/name: che
-    app.kubernetes.io/part-of: che.eclipse.org
-    component: che
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: che
-      component: che
-  template:
-    metadata:
-      labels:
-        app: che
-        app.kubernetes.io/component: che
-        app.kubernetes.io/instance: che
-        app.kubernetes.io/managed-by: che-operator
-        app.kubernetes.io/name: che
-        app.kubernetes.io/part-of: che.eclipse.org
-        component: che
-    spec:
-      serviceAccountName: che
-      volumes:
-      - name: che-public-certs
-        configMap:
-          name: ca-certs-merged
-      - name: che-self-signed-cert
-        secret:
-          secretName: self-signed-certificate
-      containers:
-      - name: che-server
-        image: ${CHE_IMAGE}
-        imagePullPolicy: Always
-        ports:
-        - name: http
-          containerPort: 8080
-        - name: http-debug
-          containerPort: 8000
-        - name: jgroups-ping
-          containerPort: 8888
-        env:
-        - name: KUBERNETES_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: CHE_AUTH_NATIVEUSER
-          value: "true"
-        envFrom:
-        - configMapRef:
-            name: che
-        volumeMounts:
-        - name: che-public-certs
-          mountPath: /public-certs
-        - name: che-self-signed-cert
-          mountPath: /self-signed-cert
-        readinessProbe:
-          httpGet:
-            path: /api/system/state
-            port: 8080
-          initialDelaySeconds: 25
-          periodSeconds: 10
-        livenessProbe:
-          httpGet:
-            path: /api/system/state
-            port: 8080
-          initialDelaySeconds: 140
-          periodSeconds: 15
-EOF
+DEPLOY_MANIFEST="${REPO_ROOT}/manifests/che/che-server-deployment.yaml"
+sed -e "s|\${NAMESPACE}|${NS}|g" -e "s|\${CHE_IMAGE}|${CHE_IMAGE}|g" < "$DEPLOY_MANIFEST" | oc apply -f -
 
 echo "Waiting for che-server pod..."
 oc rollout status deployment/che -n "$NS" --timeout=120s

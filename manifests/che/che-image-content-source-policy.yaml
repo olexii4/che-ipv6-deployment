@@ -1,0 +1,45 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# ImageContentSourcePolicy - legacy mirror config for backward compatibility.
+# Used by mirror-images-to-registry.sh. Variable: LOCAL_REGISTRY
+#
+apiVersion: operator.openshift.io/v1alpha1
+kind: ImageContentSourcePolicy
+metadata:
+  name: che-images
+spec:
+  repositoryDigestMirrors:
+  # Eclipse Che images
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/eclipse
+    source: quay.io/eclipse
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/oorel
+    source: quay.io/oorel
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/che-incubator
+    source: quay.io/che-incubator
+  # Cert-manager images
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/jetstack
+    source: quay.io/jetstack
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/openshift
+    source: quay.io/openshift
+  # DevWorkspace images
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/devfile
+    source: quay.io/devfile
+  # Docker Hub images
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/library
+    source: docker.io/library
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che/alpine
+    source: docker.io/alpine
