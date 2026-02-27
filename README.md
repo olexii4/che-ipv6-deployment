@@ -309,4 +309,4 @@ After deployment, you can manually test IPv6 URLs:
 
 ## License
 
-EPL-2.0
+This project is licensed under the Eclipse Public License 2.0. See [LICENSE](LICENSE) for details.
