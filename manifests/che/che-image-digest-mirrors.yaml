@@ -39,3 +39,7 @@ spec:
   - source: docker.io/alpine
     mirrors:
     - ${LOCAL_REGISTRY}/eclipse-che/alpine
+  # Test-infrastructure devfiles (Node.js, Python)
+  - source: registry.access.redhat.com
+    mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che

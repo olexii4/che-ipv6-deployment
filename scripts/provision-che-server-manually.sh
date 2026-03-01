@@ -10,7 +10,8 @@
 # Manually provision che-server when the operator fails to create it.
 # Use as a workaround for InstallOrUpdateFailed / "Route POST:/api/kubernetes/namespace/provision not found"
 #
-# Prerequisites: che-dashboard, che-gateway, che-host service, ca-certs-merged, self-signed-certificate exist
+# Prerequisites: che-dashboard, ca-certs-merged, self-signed-certificate exist.
+# If che-gateway is missing, run provision-che-gateway-manually.sh first.
 #
 # Usage: ./provision-che-server-manually.sh --kubeconfig <path> [--namespace <ns>] [--server-image <tag>]
 #
@@ -48,14 +49,42 @@ CHE_HOST="${CHE_HOST:-eclipse-che.apps.ostest.test.metalkube.org}"
 
 echo "Provisioning che-server in $NS (CHE_HOST=$CHE_HOST)"
 
-# Skip if che-server already deployed
+# Create che-host Service first (required by gateway for /api routes; idempotent)
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: che-host
+  namespace: $NS
+  labels:
+    app: che
+    component: che
+spec:
+  selector:
+    app: che
+    component: che
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+  sessionAffinity: None
+EOF
+
+# Skip deployment if che-server already deployed
 if oc get deploy che -n "$NS" &>/dev/null && [ "$(oc get deploy che -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "1" ]; then
-    echo "che-server already running. Skipping."
+    echo "che-server already running. Skipping deployment."
     exit 0
 fi
 
 # Ensure che ServiceAccount exists
 oc create serviceaccount che -n "$NS" 2>/dev/null || true
+
+# ClusterRole + ClusterRoleBinding: grant che SA permission to create projectrequests (OpenShift namespaces)
+# Required for POST /api/kubernetes/namespace/provision; che-operator creates this when it reconciles.
+export NAMESPACE="$NS"
+envsubst < "${REPO_ROOT}/manifests/che/che-sa-project-permissions.yaml" | oc apply -f -
 
 # Create che ConfigMap with minimal required env for che-server
 oc create configmap che -n "$NS" --from-literal="CHE_HOST=${CHE_HOST}" \

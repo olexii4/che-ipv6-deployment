@@ -638,6 +638,52 @@ if [ -n "$KUBECONFIG_PATH" ] && [ -f "$KUBECONFIG_PATH" ]; then
 fi
 
 #######################################
+# Step 4c: Fix OAuth redirect URI mismatch
+#######################################
+# Operator may set oauth-proxy redirect_url to wrong host (e.g. che-eclipse-che)
+# while route uses eclipse-che. OpenShift OAuth requires exact redirect_uri match.
+# Prevents "invalid_request" / "malformed" login errors.
+#
+OAUTH_FIX_SCRIPT="${SCRIPT_DIR}/fix-oauth-redirect.sh"
+if [ -x "$OAUTH_FIX_SCRIPT" ]; then
+    log_info "Step 4c: Fixing OAuth redirect URI (prevents login invalid_request error)"
+    # Wait for gateway configmap (operator creates it with gateway)
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if kubectl get configmap che-gateway-config-oauth-proxy -n "$NAMESPACE" &>/dev/null; then
+            if "$OAUTH_FIX_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null; then
+                log_success "OAuth redirect URI fixed"
+            else
+                log_warn "fix-oauth-redirect failed (non-fatal). If login fails, run it manually."
+            fi
+            break
+        fi
+        sleep 5
+    done
+    if ! kubectl get configmap che-gateway-config-oauth-proxy -n "$NAMESPACE" &>/dev/null; then
+        log_warn "che-gateway-config-oauth-proxy not found yet. Run fix-oauth-redirect.sh after deploy if login fails."
+    fi
+    echo
+fi
+
+#######################################
+# Step 4d: Delayed fix-image-pulls (webhook timing)
+#######################################
+# Che operator creates devworkspace-webhook-server asynchronously after CheCluster.
+# Run fix-image-pulls again after a delay so we catch the webhook when it appears.
+#
+if [ -n "$KUBECONFIG_PATH" ] && [ -x "${SCRIPT_DIR}/fix-image-pulls.sh" ]; then
+    log_info "Step 4d: Waiting 30s for operator to create webhook, then re-patching..."
+    sleep 30
+    FIX_CMD=("${SCRIPT_DIR}/fix-image-pulls.sh" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE")
+    [ -n "$CHE_SERVER_IMAGE" ] && FIX_CMD+=(--server-image "${CHE_SERVER_IMAGE##*:}")
+    [ -n "$DASHBOARD_IMAGE" ] && FIX_CMD+=(--dashboard-image "${DASHBOARD_IMAGE##*:}")
+    if "${FIX_CMD[@]}" 2>/dev/null; then
+        log_success "Delayed image patches applied"
+    fi
+    echo
+fi
+
+#######################################
 # Step 5: Wait for Che Components
 #######################################
 
@@ -664,6 +710,20 @@ for i in {1..60}; do
     # Fallback: if InstallOrUpdateFailed and no che-server after ~5 min, provision manually
     if [ "$PROVISION_FALLBACK_RUN" = false ] && [ "$i" -ge 30 ] && [ "$CHE_REASON" = "InstallOrUpdateFailed" ] && [ "$CHE_SERVER_EXISTS" = "0" ]; then
         log_warn "CheCluster stuck in InstallOrUpdateFailed, che-server not deployed. Running provisioning fallback..."
+        # First provision che-gateway if missing (main route expects it)
+        GATEWAY_EXISTS=$(kubectl get deploy che-gateway -n "$NAMESPACE" 2>/dev/null | grep -c "che-gateway" || echo "0")
+        if [ "$GATEWAY_EXISTS" = "0" ]; then
+            GATEWAY_SCRIPT="${SCRIPT_DIR}/provision-che-gateway-manually.sh"
+            if [ -x "$GATEWAY_SCRIPT" ]; then
+                log_info "Provisioning che-gateway (required by route 'che')..."
+                if "$GATEWAY_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null; then
+                    log_success "che-gateway provisioned."
+                else
+                    log_warn "provision-che-gateway-manually failed. Dashboard route may not work."
+                fi
+            fi
+        fi
+        # Then provision che-server
         PROVISION_SCRIPT="${SCRIPT_DIR}/provision-che-server-manually.sh"
         PROVISION_CMD=("$PROVISION_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE")
         [ -n "$CHE_SERVER_IMAGE" ] && PROVISION_CMD+=(--server-image "${CHE_SERVER_IMAGE##*:}")
@@ -679,12 +739,39 @@ for i in {1..60}; do
         PROVISION_FALLBACK_RUN=true
     fi
 
+    # Re-run fix-image-pulls periodically - webhook deployment may be created by operator after CheCluster
+    # Without patching, webhook has ImagePullBackOff -> no endpoints -> "no endpoints available" on workspace create
+    FIX_SCRIPT="${SCRIPT_DIR}/fix-image-pulls.sh"
+    if [ $((i % 5)) -eq 3 ] && [ -x "$FIX_SCRIPT" ] && [ -n "$KUBECONFIG_PATH" ]; then
+        log_info "Re-patching DevWorkspace webhook (ensures workspace creation works)"
+        "$FIX_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null || true
+    fi
+
     if [ $((i % 10)) -eq 0 ]; then
         log_info "Status: ${CHE_PHASE:-Pending} - ${CHE_MESSAGE} (${i}/60)"
     fi
 
     sleep 10
 done
+
+#######################################
+# Step 6: Ensure deployment fully ready (login + workspace create)
+#######################################
+# Re-run fixes and verify webhook has endpoints. Operator may have overwritten
+# oauth config; webhook may have been patched late in the loop.
+#
+CHE_URL_FINAL="${CHE_URL:-$(kubectl get checluster eclipse-che -n "$NAMESPACE" -o jsonpath='{.status.cheURL}' 2>/dev/null || echo "")}"
+[ -z "$CHE_URL_FINAL" ] && CHE_URL_FINAL="https://$(kubectl get route che -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")"
+ENSURE_SCRIPT="${SCRIPT_DIR}/ensure-deployment-ready.sh"
+if [ -n "$CHE_URL_FINAL" ] && [ -x "$ENSURE_SCRIPT" ]; then
+    log_info "Step 6: Ensuring deployment fully ready (OAuth + webhook)..."
+    if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null; then
+        log_success "Deployment verified ready"
+    else
+        log_warn "ensure-deployment-ready had issues. Login/workspace-create may need manual fix."
+    fi
+    echo
+fi
 
 # Show final status
 echo
@@ -752,6 +839,9 @@ fi
 
 echo
 log_info "=== Additional Commands ==="
+echo "If login or workspace creation fails, run:"
+echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH"
+echo
 echo "To check operator logs:"
 echo "  kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=che-operator -f"
 echo

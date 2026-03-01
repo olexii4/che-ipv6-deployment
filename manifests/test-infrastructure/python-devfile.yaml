@@ -1,0 +1,37 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# Python devfile for IPv6 testing. Served by devfile-server at /python/devfile.yaml
+#
+schemaVersion: 2.2.0
+metadata:
+  name: python-hello-world
+  displayName: Python Hello World
+  description: Simple Python application for testing IPv6
+  tags: ["Python", "Flask", "IPv6"]
+  projectType: "python"
+components:
+  - name: python
+    container:
+      image: registry.access.redhat.com/ubi8/python-39:latest
+      memoryLimit: 1024Mi
+      mountSources: true
+      endpoints:
+        - name: http-8080
+          targetPort: 8080
+commands:
+  - id: install
+    exec:
+      component: python
+      commandLine: pip install -r requirements.txt
+      workingDir: ${PROJECT_SOURCE}
+  - id: run
+    exec:
+      component: python
+      commandLine: python app.py
+      workingDir: ${PROJECT_SOURCE}

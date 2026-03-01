@@ -55,6 +55,7 @@ cd che-ipv6-deployment
 ```
 
 **What the mirror script does:**
+- In `--mode full`, mirrors images from air-gap samples (`manifests/che/air-gap-samples.json`); run `prepare-airgap-from-samples.sh` first if `build/air-gap/` is missing
 - Detects the local registry from cluster (`virthost.ostest.test.metalkube.org:5000`)
 - Automatically extracts gateway (traefik) image from Che operator bundle
 - Pulls all Che images locally (uses cache for faster re-runs)
@@ -65,6 +66,7 @@ cd che-ipv6-deployment
   - quay.io/che-incubator → local registry
   - docker.io/library → local registry (for test infrastructure)
   - docker.io/alpine → local registry (for test infrastructure)
+  - registry.access.redhat.com → local registry (Node.js, Python devfiles in test-infrastructure)
 - **Waits for cluster nodes to reboot** (~10-15 minutes)
 
 **Options:**
@@ -101,6 +103,10 @@ cd che-ipv6-deployment
 - Creates leader election RBAC for high availability
 - Deploys Che Operator with all required resources
 - Creates CheCluster custom resource with custom dashboard image
+- Patches images for local registry (fix-image-pulls) - prevents ImagePullBackOff
+- Fixes OAuth redirect URI mismatch (fix-oauth-redirect) - prevents login errors
+- Re-patches DevWorkspace webhook after delay - ensures workspace creation works
+- Runs ensure-deployment-ready - verifies login and workspace create will work
 - Waits for all components to be ready
 
 **Options:**
@@ -127,39 +133,40 @@ cd che-ipv6-deployment
 
 **The deployment script automatically shows you what to do next!**
 
-When deployment completes successfully, you'll see output like this (proxy IP:port and Che URL come from your kubeconfig and cluster):
+When deployment completes successfully, you'll see output like this:
 
 ```
 === Eclipse Che Deployed Successfully ===
-Che URL: https://eclipse-che-eclipse-che.apps.ostest.test.metalkube.org
+Che URL: https://eclipse-che.apps.ostest.test.metalkube.org
 
 === Next Steps: Access the Dashboard ===
 
-The cluster is only accessible via proxy from the kubeconfig:
-  Proxy: http://<proxy-host>:<proxy-port>
-
-Step 1: Launch Google Chrome with proxy (ostest uses self-signed cert, so --ignore-certificate-errors is required)
+The cluster is only accessible via proxy from the kubeconfig.
+Run this in your terminal (replace ~/ostest-kubeconfig.yaml with your kubeconfig path):
 
   macOS:
+    PROXY=$(grep -m1 "proxy-url:" ~/ostest-kubeconfig.yaml | awk '{print $2}' | sed -E 's|^https?://||;s|/$||')
     /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-      --proxy-server="<proxy-host>:<proxy-port>" \
+      --proxy-server="$PROXY" \
       --ignore-certificate-errors \
-      --user-data-dir="/tmp/chrome-che-$(date +%s)" \
-      --no-first-run
+      --user-data-dir="/tmp/chrome-ostest-$(date +%s)" \
+      --no-first-run \
+      "https://eclipse-che.apps.ostest.test.metalkube.org/dashboard/" 2>/dev/null
 
   Linux:
+    PROXY=$(grep -m1 "proxy-url:" ~/ostest-kubeconfig.yaml | awk '{print $2}' | sed -E 's|^https?://||;s|/$||')
     google-chrome \
-      --proxy-server="<proxy-host>:<proxy-port>" \
+      --proxy-server="$PROXY" \
       --ignore-certificate-errors \
-      --user-data-dir="/tmp/chrome-che-$(date +%s)" \
-      --no-first-run
+      --user-data-dir="/tmp/chrome-ostest-$(date +%s)" \
+      --no-first-run \
+      "https://eclipse-che.apps.ostest.test.metalkube.org/dashboard/" 2>/dev/null
 
-Step 2: Open Che Dashboard in the proxied Chrome:
-  <CHE_URL>/dashboard/
-
-Step 3: Login with OpenShift credentials
+Step 2: Login with OpenShift credentials
   (Use the kubeadmin credentials from cluster-bot)
 ```
+
+**Note:** The Che URL may vary (e.g. `eclipse-che-eclipse-che.apps...` on some installs). Use the exact URL from the deployment output.
 
 **Simply copy and paste the commands shown in the output!**
 
@@ -169,27 +176,28 @@ The script automatically:
 - ✅ Provides the exact Che URL to open
 - ✅ Gives you step-by-step instructions
 
-**Alternative: Manual proxy configuration**
+### 5. Test Devfiles (IPv6)
 
-If you prefer to use a browser extension instead:
-
-1. Install "Proxy Switcher and Manager" extension in Chrome
-2. Configure HTTP proxy using the IP and port shown in the deployment output
-   - Example: `<proxy-host>:<proxy-port>` (from `proxy-url` in kubeconfig)
-3. Enable the proxy
-4. Navigate to the Che URL shown in the output
-
-**Note:** Some Chrome versions (e.g. 145+) may have issues with `--proxy-server`. If the proxy does not work, try configuring the proxy in **macOS System Settings → Network → Wi‑Fi → Details → Proxies** instead.
-
-### 5. Test Infrastructure (Removed)
-
-Use air-gap samples from the Che dashboard Getting Started for validation.
-
-To remove the `che-test` namespace if it was deployed previously:
+Deploy the devfile HTTP server to test Che Dashboard's IPv6 URL support (POST `/dashboard/api/data/resolver`). Devfiles are pre-saved in `manifests/test-infrastructure/` and their images are mirrored in `--mode full`.
 
 ```bash
-./scripts/test-ipv6-validation.sh --kubeconfig ~/ostest-kubeconfig.yaml --cleanup
+# Deploy devfile server (serves Node.js and Python devfiles over IPv6)
+./scripts/test-ipv6-validation.sh --kubeconfig ~/ostest-kubeconfig.yaml
 ```
+
+After deployment, the script prints the test URLs. Test via Swagger (POST `/dashboard/api/data/resolver`):
+
+```
+Test Node.js devfile:
+{"url": "http://[<DEVFILE_IPV6>]:8080/nodejs/devfile.yaml"}
+
+Test Python devfile:
+{"url": "http://[<DEVFILE_IPV6>]:8080/python/devfile.yaml"}
+```
+
+Replace `<DEVFILE_IPV6>` with the IPv6 address from the script output (e.g. `fd00::123`).
+
+**Cleanup:** `./scripts/test-ipv6-validation.sh --kubeconfig ~/ostest-kubeconfig.yaml --cleanup`
 
 ## Test Scenarios
 
@@ -205,84 +213,19 @@ The dashboard serves these sample files at `/public/dashboard/devfile-registry/a
 
 Air-gap samples are served by the dashboard and work without network access. Use the Getting Started page to create workspaces.
 
-## Deployment Method
+## Documentation
 
-### Manual Operator Installation
-
-The deployment script extracts operator manifests directly from OLM bundle images and applies them manually. This approach:
-
-- ✅ **Bypasses OLM catalog networking issues** common in IPv6-only clusters
-- ✅ **Works on clusters with broken IPv6 ClusterIP connectivity**
-- ✅ **Uses official OLM bundle images** (same as OLM would use)
-- ✅ **Provides direct control** over operator versions
-- ✅ **Compatible with image mirroring** for disconnected environments
-
-**How it works:**
-
-```
-1. Pull DevWorkspace Operator bundle image using podman
-2. Extract manifests from bundle (/manifests directory)
-3. Apply CRDs, RBAC, and Deployment directly
-4. Pull Che Operator bundle image
-5. Extract and apply Che Operator manifests
-6. Create CheCluster CR with custom configuration
-7. Wait for all components to be ready
-```
-
-**Bundle images used:**
-- DevWorkspace: `quay.io/devfile/devworkspace-operator-bundle:next`
-- Eclipse Che: `quay.io/eclipse/eclipse-che-openshift-opm-bundles:next`
-
-## Repository Contents
-
-### Scripts
-
-- **[scripts/mirror-images-to-registry.sh](./scripts/mirror-images-to-registry.sh)** - Mirror Che images to cluster local registry
-- **[scripts/deploy-che-from-bundles.sh](./scripts/deploy-che-from-bundles.sh)** - Manual operator deployment from OLM bundles (runs fix-image-pulls and provision fallback automatically)
-- **[scripts/fix-image-pulls.sh](./scripts/fix-image-pulls.sh)** - Patch CheCluster and deployments to use local registry (prevents InstallOrUpdateFailed)
-- **[scripts/provision-che-server-manually.sh](./scripts/provision-che-server-manually.sh)** - Fallback: provision che-server when operator fails (fixes "Route POST:/api/kubernetes/namespace/provision not found")
-- **[scripts/test-ipv6-validation.sh](./scripts/test-ipv6-validation.sh)** - Cleanup test namespace
-- **[scripts/che-proxy-pac-helper.sh](./scripts/che-proxy-pac-helper.sh)** - Generate PAC file and Chrome proxy command for ostest
-
-## Troubleshooting
-
-### Issue: Cannot access Che dashboard
-
-**Solution:** Use HTTP proxy as described in step 5 above.
-
-The cluster is only accessible via the proxy URL from your kubeconfig. Launch Chrome with the proxy configuration shown in the deployment output.
-
-Port-forward access does not work for Che login due to OAuth redirect URI mismatch.
-
-### Issue: Deployment fails with "cannot connect to catalog"
-
-**Solution:** Use the manual deployment script `deploy-che-from-bundles.sh` which bypasses OLM catalog networking.
-
-### Issue: "Route POST:/api/kubernetes/namespace/provision not found"
-
-**Cause:** The `POST /api/kubernetes/namespace/provision` endpoint is provided by **che-server**, not the dashboard. This error appears when che-server is not deployed (CheCluster status `InstallOrUpdateFailed`). On IPv6 clusters, che-server often fails due to image pull issues (quay.io unreachable) or operator reconciliation conflicts (air-gap secret key order).
-
-**Prevention:** The deploy script automatically runs `fix-image-pulls.sh` after creating the CheCluster, and if che-server is still not deployed after ~5 minutes, runs `provision-che-server-manually.sh` as a fallback.
-
-**Manual fix (if deploy did not recover):**
-
-1. Run `fix-image-pulls.sh` to patch CheCluster and deployments:
-   ```bash
-   ./scripts/fix-image-pulls.sh --kubeconfig ~/ostest-kubeconfig.yaml \
-     --server-image pr-951 --dashboard-image pr-1442
-   ```
-
-2. If still failing, run `provision-che-server-manually.sh`:
-   ```bash
-   ./scripts/provision-che-server-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml \
-     --server-image pr-951
-   ```
+- [How it works](docs/how-it-works.md) - Deployment method and bundle flow
+- [Repository contents](docs/repository-contents.md) - Scripts reference
+- [Troubleshooting](docs/troubleshooting.md) - Common issues and fixes
 
 ## Expected Results
 
 - ✅ Deployment succeeds; Che dashboard and che-server are ready
-- ✅ Air-gap samples work via Getting Started (no external network required)
-- ✅ Dashboard serves samples at `/dashboard/api/airgap-sample/*`
+- ✅ Air-gap samples work via Getting Started
+- ✅ Workspaces can be created from served devfiles:
+  - Air-gap samples at `/dashboard/api/airgap-sample/*`
+  - IPv6 devfile server: `http://[<DEVFILE_IPV6>]:8080/nodejs/devfile.yaml` and `http://[<DEVFILE_IPV6>]:8080/python/devfile.yaml` (deploy test infra with `./scripts/test-ipv6-validation.sh`)
 
 ## License
 
