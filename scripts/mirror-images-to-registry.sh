@@ -383,7 +383,7 @@ IMAGES+=(
   "quay.io/eclipse/che-devfile-registry:next"
 )
 
-# Full set adds DevWorkspace + UDI, required for workspace creation tests.
+# Full set adds DevWorkspace + UDI + che-code, required for workspace creation tests.
 if [ "${MODE}" = "full" ]; then
   IMAGES+=(
     # Required by OLM CatalogSource created by chectl (devworkspace-operator-index:next)
@@ -391,6 +391,8 @@ if [ "${MODE}" = "full" ]; then
     "quay.io/devfile/devworkspace-controller:next"
     "quay.io/devfile/project-clone:next"
     "quay.io/devfile/universal-developer-image:ubi9-latest"
+    # Default editor (CheCluster defaultEditor: che-incubator/che-code/latest)
+    "quay.io/che-incubator/che-code:latest"
 
     # OLM bundle images (referenced by catalog indices via digest)
     # These are unpacked by OLM during operator installation

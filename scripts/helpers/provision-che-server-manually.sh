@@ -18,10 +18,10 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KUBECONFIG_FILE=""
 NAMESPACE="eclipse-che"
-REGISTRY="virthost.ostest.test.metalkube.org:5000"
+REGISTRY=""
 SERVER_IMAGE="pr-951"
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +40,12 @@ fi
 
 export KUBECONFIG="$KUBECONFIG_FILE"
 NS="$NAMESPACE"
+
+# Auto-detect registry from cluster if not provided
+if [ -z "$REGISTRY" ]; then
+  REGISTRY=$(oc get imagetagmirrorset -o jsonpath='{.items[0].spec.imageTagMirrors[0].mirrors[0]}' 2>/dev/null | sed 's|/.*||' || echo "")
+fi
+REGISTRY="${REGISTRY:-virthost.ostest.test.metalkube.org:5000}"
 
 # Auto-detect CHE_HOST from route 'che' in namespace
 if [ -z "${CHE_HOST:-}" ]; then
@@ -84,7 +90,7 @@ oc create serviceaccount che -n "$NS" 2>/dev/null || true
 # ClusterRole + ClusterRoleBinding: grant che SA permission to create projectrequests (OpenShift namespaces)
 # Required for POST /api/kubernetes/namespace/provision; che-operator creates this when it reconciles.
 export NAMESPACE="$NS"
-envsubst < "${REPO_ROOT}/manifests/che/che-sa-project-permissions.yaml" | oc apply -f -
+envsubst < "${REPO_ROOT}/manifests/che/helpers/che-sa-project-permissions.yaml" | oc apply -f -
 
 # Create che ConfigMap with minimal required env for che-server
 oc create configmap che -n "$NS" --from-literal="CHE_HOST=${CHE_HOST}" \

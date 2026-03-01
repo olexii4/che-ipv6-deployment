@@ -36,6 +36,9 @@ ${CHE_SERVER_PROXY_LINE}
             imagePullPolicy: Always
 
   devEnvironments:
+    # Use ephemeral storage when cluster has no StorageClass (e.g. ostest metal)
+    storage:
+      pvcStrategy: ephemeral
     startTimeoutSeconds: 600
     defaultEditor: che-incubator/che-code/latest
     defaultComponents:

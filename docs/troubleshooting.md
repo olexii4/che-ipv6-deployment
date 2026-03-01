@@ -6,6 +6,34 @@
 ```
 This re-applies OAuth and webhook fixes and verifies readiness.
 
+## Issue: "no persistent volumes available for this claim and no storage class is set"
+
+**Symptom:** Workspace stays in Starting; PVC `claim-devworkspace` is Pending.
+
+**Cause:** Cluster has no StorageClass and no available PVs. ostest metal clusters often lack storage provisioning.
+
+**Solution:** Switch Che to ephemeral storage (no PVC needed):
+
+```bash
+oc patch checluster eclipse-che -n eclipse-che --type=merge -p '{"spec":{"devEnvironments":{"storage":{"pvcStrategy":"ephemeral"}}}}'
+```
+
+Then delete the stuck workspace in the dashboard and create a new one. Ephemeral workspaces use emptyDir; data is lost when the workspace stops.
+
+**Note:** The deploy template (`manifests/che/checluster.yaml`) now includes this by default for clusters without storage.
+
+## Issue: "Application is not available" at Che URL
+
+**Symptom:** The route URL (e.g. https://eclipse-che.apps.ostest.test.metalkube.org/dashboard/) returns "Application is not available".
+
+**Cause:** The route points to `che-gateway` service, but che-gateway was never deployed (operator stuck in Pending). No pods back the route.
+
+**Solution:** Run the gateway provision script:
+```bash
+./scripts/helpers/provision-che-gateway-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml
+```
+Then retry. The deploy script now triggers this fallback automatically after ~3 minutes if che-gateway is missing.
+
 ## Issue: Cannot access Che dashboard
 
 **Solution:** Use HTTP proxy as described in the README (Step 4: Access Eclipse Che Dashboard). Launch Chrome with the proxy from the deployment output.
@@ -47,15 +75,15 @@ Then restart Chrome and retry login. If the operator overwrites the fix, run it 
      --server-image pr-951 --dashboard-image pr-1442
    ```
 
-2. If still failing, run `provision-che-server-manually.sh`:
+2. If still failing, run:
    ```bash
-   ./scripts/provision-che-server-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml \
+   ./scripts/helpers/provision-che-server-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml \
      --server-image pr-951
    ```
 
-3. If che-gateway is missing, run `provision-che-gateway-manually.sh`:
+3. If che-gateway is missing ("Application is not available"), run:
    ```bash
-   ./scripts/provision-che-gateway-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml
+   ./scripts/helpers/provision-che-gateway-manually.sh --kubeconfig ~/ostest-kubeconfig.yaml
    ```
 
 ## Issue: "403 Forbidden" on POST /api/kubernetes/namespace/provision
@@ -82,7 +110,7 @@ Then restart Chrome and retry login. If the operator overwrites the fix, run it 
 
 **Cause:** The manual gateway was missing the header-rewrite middleware. The OpenShift API requires `Authorization: Bearer`; oauth-proxy sends `X-Forwarded-Access-Token`. The forwardAuth call failed because the token was in the wrong header.
 
-**Solution:** Re-run `provision-che-gateway-manually.sh` (recent versions include the header-rewrite plugin). Ensure you access the dashboard via the main Che URL and complete OAuth login before calling the API.
+**Solution:** Re-run `./scripts/helpers/provision-che-gateway-manually.sh` (includes the header-rewrite plugin). Ensure you access the dashboard via the main Che URL and complete OAuth login before calling the API.
 
 ## Issue: "no endpoints available for service devworkspace-webhookserver" (500 on workspace create)
 
@@ -99,12 +127,100 @@ failed calling webhook "mutate.devworkspace-controller.svc": no endpoints availa
 ```
 Then retry workspace creation. The deploy script runs this automatically and retries during the wait loop.
 
+## Issue: "Failed to open the workspace" / pods forbidden by Security Context Constraint (SCC)
+
+**Symptom:** When creating a workspace, you see:
+```
+Error creating DevWorkspace deployment: FailedCreate pods "workspace...-" is forbidden: unable to validate against any security context constraint:
+provider "anyuid": Forbidden: not usable by user or serviceaccount
+provider restricted-v2: .containers[0].capabilities.add: Invalid value: "SETGID"...
+```
+
+**Cause:** Workspace pods require `SETGID`, `SETUID`, and `allowPrivilegeEscalation` for dev containers. The default `restricted-v2` SCC denies these. The workspace ServiceAccount must be allowed to use the `anyuid` SCC.
+
+**Solution:** Run `ensure-deployment-ready` (applies the SCC fix automatically):
+```bash
+./scripts/ensure-deployment-ready.sh --kubeconfig ~/ostest-kubeconfig.yaml
+```
+
+Or apply manually (both required on ostest clusters):
+```bash
+# 1. Allow workspace service accounts to use anyuid
+oc patch scc anyuid --type=json -p='[{"op":"add","path":"/groups/-","value":"system:serviceaccounts"}]'
+
+# 2. Allow SETGID/SETUID capabilities (workspace devfiles require these)
+oc patch scc anyuid --type=merge -p '{"allowedCapabilities":["SETGID","SETUID"]}'
+```
+
+Then delete the failed workspace in the dashboard and create a new one.
+
+**Note:** The deploy script runs `ensure-deployment-ready` at the end, which now applies this SCC fix. On freshly provisioned clusters, the fix is applied during deploy.
+
 ## Issue: "User system:serviceaccount:eclipse-che:che cannot create resource projectrequests" (403 on namespace provision)
 
 **Cause:** The `che` ServiceAccount lacks cluster-scoped permission to create OpenShift projects (projectrequests). This happens when the Che operator never fully reconciled (e.g. InstallOrUpdateFailed) and the manual provisioning scripts were used.
 
-**Solution:** Re-run `provision-che-server-manually.sh` (recent versions create the ClusterRole and ClusterRoleBinding for che SA). Or apply manually:
+**Solution:** Re-run `./scripts/helpers/provision-che-server-manually.sh` (creates ClusterRole/ClusterRoleBinding for che SA). Or apply manually:
 ```bash
 export NAMESPACE=eclipse-che
 envsubst < manifests/che/che-sa-project-permissions.yaml | oc apply -f -
 ```
+
+## Issue: InstallOrUpdateFailed + "Waiting for DevWorkspaceRouting controller to be ready"
+
+**Symptom:** CheCluster status is `InstallOrUpdateFailed`. Workspaces stay in "Starting" with message "Waiting for DevWorkspaceRouting controller to be ready". Operator logs show: `Operation cannot be fulfilled on deployments.apps "che-dashboard": the object has been modified`.
+
+**Cause:** The `che-dashboard-airgap` secret causes the Che operator to enter a reconcile loop. The operator iterates over secret keys in non-deterministic order (Go map), producing different volume mount order each reconcile → deployment spec drift → update conflicts.
+
+**Why deploy-che-ipv6-chectl works:** That script never creates the air-gap secret, so no reconcile loop and CheCluster can become Available.
+
+**Solution:**
+
+1. **Redeploy with --no-airgap-samples (recommended):** The deploy script now defaults to `--no-airgap-samples`. If you previously deployed with air-gap, delete the secret and redeploy:
+   ```bash
+   oc delete secret che-dashboard-airgap -n eclipse-che
+   # Then redeploy or restart the Che operator to trigger reconcile
+   oc delete pod -n eclipse-che -l app.kubernetes.io/name=che-operator --force --grace-period=0
+   ```
+
+2. **Or deploy fresh with --no-airgap-samples:**
+   ```bash
+   ./scripts/deploy-che-from-bundles.sh --kubeconfig ~/ostest-kubeconfig.yaml --no-airgap-samples
+   ```
+
+3. **If you need air-gap samples:** Use `--airgap-samples` and accept that CheCluster may stay InstallOrUpdateFailed until the che-operator is fixed to sort secret keys when building volume mounts.
+
+## Issue: Workspace pod ImagePullBackOff for che-code (quay.io/che-incubator/che-code:latest)
+
+**Symptom:** Workspace pod fails with:
+```
+Failed to pull image "quay.io/che-incubator/che-code:latest": ... network is unreachable
+Mirrors also failed: [virthost.../eclipse-che/che-incubator/che-code:latest: manifest unknown]
+```
+
+**Cause:** The cluster cannot reach quay.io (IPv6-only / air-gap). The ICSP redirects pulls to the local registry, but `che-code` was never mirrored there.
+
+**Solution:** Re-run the mirror script with `--mode full` so che-code is included and pushed to the registry. Run from a host that can reach both quay.io and the cluster registry:
+```bash
+./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
+```
+Then delete the failed workspace in the dashboard and create a new one. The mirror script now includes `quay.io/che-incubator/che-code:latest` in full mode.
+
+## Issue: "container has runAsNonRoot and image will run as root" (che-gateway in workspace pod)
+
+**Symptom:** Workspace pod fails with:
+```
+Error: container has runAsNonRoot and image will run as root (pod: "workspace...", container: che-gateway)
+```
+
+**Cause:** Workspace pods include a che-gateway (Traefik) sidecar injected by Che's routing controller. That sidecar is configured with `runAsNonRoot: true` but the Traefik image runs as root (UID 0). Namespace pod-security labels and DevWorkspaceOperatorConfig do not override the Che routing controller's hardcoded security context for the gateway.
+
+**Solution:** Run `ensure-deployment-ready` (applied automatically at deploy end; also run after creating a new workspace if needed):
+```bash
+./scripts/ensure-deployment-ready.sh --kubeconfig ~/ostest-kubeconfig.yaml
+```
+For a quick fix without other steps, use `--gateway-patch-only`:
+```bash
+./scripts/ensure-deployment-ready.sh --kubeconfig ~/ostest-kubeconfig.yaml --gateway-patch-only
+```
+Then start (or restart) the workspace. The deploy script runs the full fix at the end and re-runs the gateway patch after 20s to catch new workspaces. For workspaces created later, run the script again. The Che routing controller may overwrite the patch on reconcile; if so, run the script and restart the workspace promptly.

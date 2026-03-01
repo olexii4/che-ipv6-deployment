@@ -39,7 +39,13 @@ DASHBOARD_IMAGE=""
 CHE_SERVER_IMAGE=""
 KUBECONFIG_PATH=""
 SKIP_DEVWORKSPACE=false
-AIRGAP_SAMPLES=true
+# Default: false. Air-gap secret causes Che operator reconcile loop (non-deterministic
+# volume mount order) -> InstallOrUpdateFailed -> DevWorkspaceRouting never ready.
+# deploy-che-ipv6-chectl works because it never creates the air-gap secret.
+# Use --airgap-samples to enable when che-operator is fixed to sort secret keys.
+AIRGAP_SAMPLES=false
+# Deploy devfile HTTP server for IPv6 testing (Node.js, Python devfiles at http://[IPv6]:8080/...)
+DEPLOY_DEVFILE_SERVER=false
 DEVWORKSPACE_BUNDLE_IMAGE="quay.io/devfile/devworkspace-operator-bundle:next"
 CHE_BUNDLE_IMAGE="quay.io/eclipse/eclipse-che-olm-bundle@sha256:b525748e410cf2ddb405209ac5bce7b4ed2e401b7141f6c4edcea0e32e5793a1"
 
@@ -99,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             AIRGAP_SAMPLES=false
             shift
             ;;
+        --deploy-devfile-server)
+            DEPLOY_DEVFILE_SERVER=true
+            shift
+            ;;
         --help)
             echo "Manual Eclipse Che Deployment from OLM Bundles"
             echo ""
@@ -112,8 +122,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-devworkspace              Skip DevWorkspace Operator installation"
             echo "  --devworkspace-bundle <image>    DevWorkspace bundle image (default: quay.io/devfile/devworkspace-operator-bundle:next)"
             echo "  --che-bundle <image>             Che bundle image (default: quay.io/eclipse/eclipse-che-openshift-opm-bundles:next)"
-            echo "  --airgap-samples                 Enable air-gap samples (mount in dashboard, no proxy needed) (default)"
-            echo "  --no-airgap-samples              Disable air-gap samples (samples require GitHub/proxy)"
+            echo "  --airgap-samples                 Enable air-gap samples (may cause InstallOrUpdateFailed until operator fix)"
+            echo "  --no-airgap-samples              Disable air-gap samples (default, matches chectl behavior)"
+            echo "  --deploy-devfile-server         Deploy devfile HTTP server for IPv6 testing (Node.js, Python devfiles)"
             echo "  --help                           Show this help message"
             exit 0
             ;;
@@ -707,13 +718,25 @@ for i in {1..60}; do
         break
     fi
 
-    # Fallback: if InstallOrUpdateFailed and no che-server after ~5 min, provision manually
+    # Fallback: if che-gateway or che-server missing after ~3 min, provision manually
+    # Route exists but points to che-gateway; without it we get "Application is not available"
+    GATEWAY_EXISTS=$(kubectl get deploy che-gateway -n "$NAMESPACE" 2>/dev/null | grep -c "che-gateway" || echo "0")
+    NEED_FALLBACK=false
+    if [ "$PROVISION_FALLBACK_RUN" = false ] && [ "$i" -ge 20 ]; then
+        if [ "$GATEWAY_EXISTS" = "0" ] || [ "$CHE_SERVER_EXISTS" = "0" ]; then
+            NEED_FALLBACK=true
+        fi
+    fi
+    # Also trigger on explicit InstallOrUpdateFailed
     if [ "$PROVISION_FALLBACK_RUN" = false ] && [ "$i" -ge 30 ] && [ "$CHE_REASON" = "InstallOrUpdateFailed" ] && [ "$CHE_SERVER_EXISTS" = "0" ]; then
-        log_warn "CheCluster stuck in InstallOrUpdateFailed, che-server not deployed. Running provisioning fallback..."
-        # First provision che-gateway if missing (main route expects it)
-        GATEWAY_EXISTS=$(kubectl get deploy che-gateway -n "$NAMESPACE" 2>/dev/null | grep -c "che-gateway" || echo "0")
+        NEED_FALLBACK=true
+    fi
+    if [ "$NEED_FALLBACK" = true ]; then
+        log_warn "che-gateway or che-server not deployed. Running provisioning fallback..."
+        # First provision che-gateway if missing (main route expects it - otherwise "Application is not available")
         if [ "$GATEWAY_EXISTS" = "0" ]; then
-            GATEWAY_SCRIPT="${SCRIPT_DIR}/provision-che-gateway-manually.sh"
+            GATEWAY_SCRIPT="${SCRIPT_DIR}/helpers/provision-che-gateway-manually.sh"
+            [ ! -x "$GATEWAY_SCRIPT" ] && GATEWAY_SCRIPT="${SCRIPT_DIR}/provision-che-gateway-manually.sh"
             if [ -x "$GATEWAY_SCRIPT" ]; then
                 log_info "Provisioning che-gateway (required by route 'che')..."
                 if "$GATEWAY_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null; then
@@ -724,7 +747,8 @@ for i in {1..60}; do
             fi
         fi
         # Then provision che-server
-        PROVISION_SCRIPT="${SCRIPT_DIR}/provision-che-server-manually.sh"
+        PROVISION_SCRIPT="${SCRIPT_DIR}/helpers/provision-che-server-manually.sh"
+        [ ! -x "$PROVISION_SCRIPT" ] && PROVISION_SCRIPT="${SCRIPT_DIR}/provision-che-server-manually.sh"
         PROVISION_CMD=("$PROVISION_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE")
         [ -n "$CHE_SERVER_IMAGE" ] && PROVISION_CMD+=(--server-image "${CHE_SERVER_IMAGE##*:}")
         if [ -x "$PROVISION_SCRIPT" ] && [ -n "$KUBECONFIG_PATH" ]; then
@@ -739,12 +763,14 @@ for i in {1..60}; do
         PROVISION_FALLBACK_RUN=true
     fi
 
-    # Re-run fix-image-pulls periodically - webhook deployment may be created by operator after CheCluster
-    # Without patching, webhook has ImagePullBackOff -> no endpoints -> "no endpoints available" on workspace create
+    # Re-run fix-image-pulls only at i=3 and i=15 - avoid constant pod churn that prevents DWO from becoming Ready
+    # (Che operator waits for DWO before deploying che-server/gateway)
     FIX_SCRIPT="${SCRIPT_DIR}/fix-image-pulls.sh"
-    if [ $((i % 5)) -eq 3 ] && [ -x "$FIX_SCRIPT" ] && [ -n "$KUBECONFIG_PATH" ]; then
-        log_info "Re-patching DevWorkspace webhook (ensures workspace creation works)"
-        "$FIX_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null || true
+    if [ "$i" -eq 3 ] || [ "$i" -eq 15 ]; then
+        if [ -x "$FIX_SCRIPT" ] && [ -n "$KUBECONFIG_PATH" ]; then
+            log_info "Re-patching DevWorkspace webhook (ensures workspace creation works)"
+            "$FIX_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null || true
+        fi
     fi
 
     if [ $((i % 10)) -eq 0 ]; then
@@ -764,13 +790,37 @@ CHE_URL_FINAL="${CHE_URL:-$(kubectl get checluster eclipse-che -n "$NAMESPACE" -
 [ -z "$CHE_URL_FINAL" ] && CHE_URL_FINAL="https://$(kubectl get route che -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")"
 ENSURE_SCRIPT="${SCRIPT_DIR}/ensure-deployment-ready.sh"
 if [ -n "$CHE_URL_FINAL" ] && [ -x "$ENSURE_SCRIPT" ]; then
-    log_info "Step 6: Ensuring deployment fully ready (OAuth + webhook)..."
+    log_info "Step 6: Ensuring deployment fully ready (OAuth + webhook + che-gateway)..."
     if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" 2>/dev/null; then
         log_success "Deployment verified ready"
     else
         log_warn "ensure-deployment-ready had issues. Login/workspace-create may need manual fix."
     fi
+    # Re-run gateway patch after 20s to catch workspaces created during the first run
+    log_info "Re-running che-gateway patch in 20s (catches new workspaces)..."
+    sleep 20
+    if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null; then
+        log_success "Gateway patch re-applied"
+    fi
     echo
+fi
+
+#######################################
+# Step 7: Deploy devfile HTTP server (optional)
+#######################################
+if [ "$DEPLOY_DEVFILE_SERVER" = true ]; then
+    DEVFILE_SCRIPT="${SCRIPT_DIR}/test-ipv6-validation.sh"
+    if [ -x "$DEVFILE_SCRIPT" ]; then
+        log_info "Step 7: Deploying devfile HTTP server (IPv6 Node.js, Python)..."
+        if "$DEVFILE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --che-namespace "$NAMESPACE" 2>/dev/null; then
+            log_success "Devfile server deployed"
+        else
+            log_warn "Devfile server deployment had issues. Run manually: $DEVFILE_SCRIPT --kubeconfig $KUBECONFIG_PATH"
+        fi
+        echo
+    else
+        log_warn "test-ipv6-validation.sh not found or not executable, skipping devfile server"
+    fi
 fi
 
 # Show final status
@@ -781,8 +831,9 @@ echo
 kubectl get pods -n "$NAMESPACE"
 echo
 
-# Get Che URL
+# Get Che URL - use route host if status.cheURL not set (e.g. when operator didn't finish reconciling)
 CHE_URL=$(kubectl get checluster eclipse-che -n "$NAMESPACE" -o jsonpath='{.status.cheURL}' 2>/dev/null || echo "")
+[ -z "$CHE_URL" ] && CHE_URL="https://$(kubectl get route che -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")"
 if [ -n "$CHE_URL" ]; then
     echo
     log_success "=== Eclipse Che Deployed Successfully ==="
@@ -795,30 +846,26 @@ if [ -n "$CHE_URL" ]; then
         PROXY_URL="${PROXY_URL%/}"  # Remove trailing slash
 
         if [ -n "$PROXY_URL" ]; then
-            PROXY_HOST=$(echo "$PROXY_URL" | sed 's|http://||' | sed 's|https://||' | cut -d: -f1)
-            PROXY_PORT=$(echo "$PROXY_URL" | sed 's|http://||' | sed 's|https://||' | cut -d: -f2 | tr -d '/')
-
             log_info "=== Next Steps: Access the Dashboard ==="
             echo
-            echo "The cluster is only accessible via proxy from the kubeconfig:"
-            echo "  Proxy: $PROXY_URL"
-            echo
-            echo "Step 1: Launch Google Chrome with proxy (2>/dev/null suppresses stderr):"
-            echo "  (--ignore-certificate-errors required for ostest self-signed cert)"
+            echo "The cluster is only accessible via proxy from the kubeconfig."
+            echo "Run this in your terminal:"
             echo
             echo "  macOS:"
+            echo "    PROXY=\$(grep -m1 \"proxy-url:\" $KUBECONFIG_PATH | awk '{print \$2}' | sed -E 's|^https?://||;s|/\$||')"
             echo "    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\"
-            echo "      --proxy-server=\"${PROXY_HOST}:${PROXY_PORT}\" \\"
+            echo "      --proxy-server=\"\$PROXY\" \\"
             echo "      --ignore-certificate-errors \\"
-            echo "      --user-data-dir=\"/tmp/chrome-che-\$(date +%s)\" \\"
+            echo "      --user-data-dir=\"/tmp/chrome-ostest-\$(date +%s)\" \\"
             echo "      --no-first-run \\"
             echo "      \"${CHE_URL}/dashboard/\" 2>/dev/null"
             echo
             echo "  Linux:"
+            echo "    PROXY=\$(grep -m1 \"proxy-url:\" $KUBECONFIG_PATH | awk '{print \$2}' | sed -E 's|^https?://||;s|/\$||')"
             echo "    google-chrome \\"
-            echo "      --proxy-server=\"${PROXY_HOST}:${PROXY_PORT}\" \\"
+            echo "      --proxy-server=\"\$PROXY\" \\"
             echo "      --ignore-certificate-errors \\"
-            echo "      --user-data-dir=\"/tmp/chrome-che-\$(date +%s)\" \\"
+            echo "      --user-data-dir=\"/tmp/chrome-ostest-\$(date +%s)\" \\"
             echo "      --no-first-run \\"
             echo "      \"${CHE_URL}/dashboard/\" 2>/dev/null"
             echo
@@ -841,6 +888,8 @@ echo
 log_info "=== Additional Commands ==="
 echo "If login or workspace creation fails, run:"
 echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH"
+echo "If a new workspace fails with 'runAsNonRoot' (che-gateway), run:"
+echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH --gateway-patch-only"
 echo
 echo "To check operator logs:"
 echo "  kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=che-operator -f"

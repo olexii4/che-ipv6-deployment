@@ -13,9 +13,12 @@
 # Runs:
 #   1. fix-image-pulls - patches DWO webhook for workspace creation
 #   2. fix-oauth-redirect - fixes login invalid_request error
-#   3. Waits for devworkspace-webhook to have endpoints (required for workspace create)
+#   3. Fix workspace SCC - adds system:serviceaccounts to anyuid (prevents "Forbidden: not usable by user or serviceaccount")
+#   4. DevWorkspaceOperatorConfig - runAsNonRoot:false for workspace containers
+#   5. Patch workspace Deployments - che-gateway runAsNonRoot:false (Traefik image runs as root)
+#   6. Waits for devworkspace-webhook to have endpoints (required for workspace create)
 #
-# Usage: ./ensure-deployment-ready.sh --kubeconfig <path> [--namespace <ns>] [--no-wait]
+# Usage: ./ensure-deployment-ready.sh --kubeconfig <path> [--namespace <ns>] [--no-wait] [--gateway-patch-only]
 #
 set -e
 
@@ -23,22 +26,64 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KUBECONFIG_FILE=""
 NAMESPACE="eclipse-che"
 NO_WAIT=false
+GATEWAY_PATCH_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --kubeconfig) KUBECONFIG_FILE="$2"; shift 2 ;;
         --namespace) NAMESPACE="$2"; shift 2 ;;
         --no-wait) NO_WAIT=true; shift ;;
+        --gateway-patch-only) GATEWAY_PATCH_ONLY=true; shift ;;
         *) echo "Unknown: $1"; exit 1 ;;
     esac
 done
 
 if [ -z "$KUBECONFIG_FILE" ] || [ ! -f "$KUBECONFIG_FILE" ]; then
-    echo "Usage: $0 --kubeconfig <path> [--namespace eclipse-che] [--no-wait]"
+    echo "Usage: $0 --kubeconfig <path> [--namespace eclipse-che] [--no-wait] [--gateway-patch-only]"
     exit 1
 fi
 
 export KUBECONFIG="$KUBECONFIG_FILE"
+
+# Helper: patch workspace Deployments to allow che-gateway (root image) to run.
+# Invoked by --gateway-patch-only and as part of full run.
+patch_workspace_gateway_deployments() {
+    local NS
+    for NS in $(oc get devworkspace -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u); do
+        patch_deployments_in_namespace "$NS"
+    done
+    for NS in $(oc get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '\-che\-' || true); do
+        patch_deployments_in_namespace "$NS"
+    done
+}
+
+patch_deployments_in_namespace() {
+    local NS="$1"
+    local DEPLOY CNAME IDX CUR
+    for DEPLOY in $(oc get deploy -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+        CONTAINERS=$(oc get deploy "$DEPLOY" -n "$NS" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null)
+        IDX=0
+        for CNAME in $CONTAINERS; do
+            if [ "$CNAME" = "che-gateway" ]; then
+                CUR=$(oc get deploy "$DEPLOY" -n "$NS" -o jsonpath="{.spec.template.spec.containers[$IDX].securityContext.runAsNonRoot}" 2>/dev/null || echo "")
+                if [ "$CUR" = "true" ]; then
+                    if oc patch deploy "$DEPLOY" -n "$NS" --type=json -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$IDX/securityContext/runAsNonRoot\",\"value\":false}]" 2>/dev/null; then
+                        echo "  Patched $NS/$DEPLOY (che-gateway runAsNonRoot=false)"
+                    fi
+                fi
+                break
+            fi
+            IDX=$((IDX + 1))
+        done
+    done
+}
+
+if [ "$GATEWAY_PATCH_ONLY" = true ]; then
+    echo "=== Patching workspace Deployments (che-gateway runAsNonRoot) ==="
+    patch_workspace_gateway_deployments
+    echo "Done."
+    exit 0
+fi
 
 echo "=== Ensuring Eclipse Che deployment is ready ==="
 
@@ -60,7 +105,72 @@ else
     echo "fix-oauth-redirect.sh not found, skipping"
 fi
 
-# 3. Wait for devworkspace-webhook to have endpoints (workspace creation will fail otherwise)
+# 3. Fix workspace SCC (allows workspace pods to run with SETGID/SETUID/allowPrivilegeEscalation)
+# Ostest/metal clusters: workspace devfiles need anyuid SCC with SETGID/SETUID in allowedCapabilities.
+# Without groups: workspace SA "Forbidden: not usable by user or serviceaccount"
+# Without allowedCapabilities: "Invalid value: SETGID/SETUID: capability may not be added"
+echo "Ensuring workspace pods can use anyuid SCC..."
+if oc get scc anyuid &>/dev/null; then
+    NEED_PATCH=false
+    if ! oc get scc anyuid -o jsonpath='{.groups}' 2>/dev/null | grep -q 'system:serviceaccounts'; then
+        oc patch scc anyuid --type=json -p='[{"op":"add","path":"/groups/-","value":"system:serviceaccounts"}]' 2>/dev/null && \
+            echo "  Added system:serviceaccounts to anyuid groups" || \
+            echo "  WARN: Could not add system:serviceaccounts to anyuid (may need cluster-admin)"
+    fi
+    if ! oc get scc anyuid -o jsonpath='{.allowedCapabilities}' 2>/dev/null | grep -q 'SETGID'; then
+        oc patch scc anyuid --type=merge -p '{"allowedCapabilities":["SETGID","SETUID"]}' 2>/dev/null && \
+            echo "  Added SETGID,SETUID to anyuid allowedCapabilities - workspaces will start" || \
+            echo "  WARN: Could not add allowedCapabilities to anyuid"
+    else
+        echo "  anyuid SCC already configured for workspaces - OK"
+    fi
+else
+    echo "  anyuid SCC not found (non-OpenShift?), skipping"
+fi
+
+# 3b. DevWorkspaceOperatorConfig - runAsNonRoot:false for workspace containers.
+# Che routing controller still hardcodes runAsNonRoot:true for che-gateway, so we also patch Deployments (step 4b).
+if oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" &>/dev/null; then
+    CUR=$(oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" -o jsonpath='{.config.workspace.containerSecurityContext.runAsNonRoot}' 2>/dev/null || echo "")
+    if [ "$CUR" != "false" ]; then
+        if oc patch devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" --type=merge -p '{"config":{"workspace":{"containerSecurityContext":{"runAsNonRoot":false}}}}' 2>/dev/null; then
+            echo "  DevWorkspaceOperatorConfig: set containerSecurityContext.runAsNonRoot=false"
+        else
+            echo "  WARN: Could not patch devworkspace-config (Che operator may own it)"
+        fi
+    fi
+fi
+
+# 4. Fix workspace namespace Pod Security (allows che-gateway sidecar to run as root)
+# Workspace pods include che-gateway (Traefik) which runs as root. Restricted PSA adds runAsNonRoot,
+# causing "container has runAsNonRoot and image will run as root". Use privileged for workspace namespaces.
+echo "Ensuring workspace namespaces allow root containers (che-gateway)..."
+for NS in $(oc get devworkspace -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u); do
+    CUR=$(oc get namespace "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null || echo "")
+    if [ "$CUR" != "privileged" ]; then
+        if oc label namespace "$NS" pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged --overwrite 2>/dev/null; then
+            echo "  Set $NS to pod-security=privileged (che-gateway can run as root)"
+        else
+            echo "  WARN: Could not label $NS (may need cluster-admin)"
+        fi
+    fi
+done
+# Also fix namespaces matching <username>-che-* (created before first DevWorkspace exists)
+for NS in $(oc get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '\-che\-' || true); do
+    CUR=$(oc get namespace "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null || echo "")
+    if [ "$CUR" != "privileged" ]; then
+        oc label namespace "$NS" pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged --overwrite 2>/dev/null && \
+            echo "  Set $NS to pod-security=privileged" || true
+    fi
+done
+
+# 4b. Patch workspace Deployments: che-gateway sidecar has runAsNonRoot:true from Che routing controller
+# but the Traefik image runs as root. DevWorkspaceOperatorConfig runAsNonRoot:false doesn't apply to gateway.
+# Directly patch Deployments that have a che-gateway container.
+echo "Patching workspace Deployments (che-gateway runAsNonRoot)..."
+patch_workspace_gateway_deployments
+
+# 5. Wait for devworkspace-webhook to have endpoints (workspace creation will fail otherwise)
 if [ "$NO_WAIT" = false ]; then
     echo "Waiting for devworkspace-webhook to have endpoints..."
     for i in $(seq 1 24); do
