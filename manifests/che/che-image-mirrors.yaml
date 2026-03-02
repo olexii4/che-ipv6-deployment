@@ -27,3 +27,7 @@ spec:
   - source: quay.io/openshift
     mirrors:
     - virthost.ostest.test.metalkube.org:5000/eclipse-che/openshift
+  # Test-infrastructure devfiles (Node.js, Python) - ubi8/nodejs-18, ubi8/python-39
+  - source: registry.access.redhat.com
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che

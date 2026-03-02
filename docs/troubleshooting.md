@@ -206,6 +206,34 @@ Mirrors also failed: [virthost.../eclipse-che/che-incubator/che-code:latest: man
 ```
 Then delete the failed workspace in the dashboard and create a new one. The mirror script now includes `quay.io/che-incubator/che-code:latest` in full mode.
 
+## Issue: Workspace fails with "Init Container project-clone has state ImagePullBackOff" or devworkspace-webhook ImagePullBackOff
+
+**Symptom:** Workspace shows "Error creating DevWorkspace deployment: Init Container project-clone has state ImagePullBackOff", or devworkspace-webhook-server pods fail with:
+```
+Failed to pull image "quay.io/devfile/devworkspace-controller:sha-9b46583": manifest unknown
+Failed to pull image "quay.io/devfile/project-clone:sha-9b46583": manifest unknown
+```
+
+**Cause:** The DevWorkspace Operator pins images to commit-based tags (e.g. `sha-9b46583`). The cluster cannot reach quay.io (IPv6-only). The ImageTagMirrorSet redirects to the local registry, but these exact tags were never mirrored.
+
+**Solution:** Re-run the mirror script. The mirror script now includes `devworkspace-controller:sha-9b46583` and `project-clone:sha-9b46583` in full mode. Run from a host that can reach both quay.io and the cluster registry (use kubeconfig proxy):
+```bash
+./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
+```
+Then delete the failed workspace in the dashboard and create a new one. You can also use `--mirror-from-namespace devworkspace-controller` to auto-discover sha-* images from cluster pods.
+
+## Issue: Node.js/Python devfile server workspaces fail with ImagePullBackOff (registry.access.redhat.com/ubi8)
+
+**Symptom:** Workspace created from `http://[fd02::3823]:8080/nodejs/devfile.yaml` or `/python/devfile.yaml` fails with ImagePullBackOff for `registry.access.redhat.com/ubi8/nodejs-18` or `ubi8/python-39`.
+
+**Cause:** IPv6-only cluster cannot reach registry.access.redhat.com. The ImageTagMirrorSet redirects to the local registry, but these images were never mirrored.
+
+**Solution:** Run the mirror script with `--mode full` (extracts test-infrastructure devfile images):
+```bash
+./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
+```
+The mirror script extracts `ubi8/nodejs-18:latest` and `ubi8/python-39:latest` from `manifests/test-infrastructure/`. Then delete the failed workspace and create a new one.
+
 ## Issue: "container has runAsNonRoot and image will run as root" (che-gateway in workspace pod)
 
 **Symptom:** Workspace pod fails with:

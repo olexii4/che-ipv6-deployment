@@ -195,13 +195,19 @@ After deployment, the script prints the test URLs. Test via Swagger (POST `/dash
 
 ```
 Test Node.js devfile:
-{"url": "http://[<DEVFILE_IPV6>]:8080/nodejs/devfile.yaml"}
+{"url": "http://[fd02::3823]:8080/nodejs/devfile.yaml"}
 
 Test Python devfile:
-{"url": "http://[<DEVFILE_IPV6>]:8080/python/devfile.yaml"}
+{"url": "http://[fd02::3823]:8080/python/devfile.yaml"}
 ```
 
-Replace `<DEVFILE_IPV6>` with the IPv6 address from the script output (e.g. `fd00::123`).
+**Note:** The IPv6 address is the devfile-server ClusterIP in `che-test` namespace. Get it with:
+`oc get svc devfile-server -n che-test -o jsonpath='{.spec.clusterIPs[0]}'`
+
+**Images:** Node.js and Python devfiles use `registry.access.redhat.com/ubi8/nodejs-18` and `ubi8/python-39`. On IPv6-only clusters, mirror them first:
+```bash
+./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
+```
 
 **Cleanup:** `./scripts/test-ipv6-validation.sh --kubeconfig ~/ostest-kubeconfig.yaml --cleanup`
 
@@ -231,7 +237,7 @@ Air-gap samples are served by the dashboard and work without network access. Use
 - ✅ Air-gap samples work via Getting Started
 - ✅ Workspaces can be created from served devfiles:
   - Air-gap samples at `/dashboard/api/airgap-sample/*`
-  - IPv6 devfile server: `http://[<DEVFILE_IPV6>]:8080/nodejs/devfile.yaml` and `http://[<DEVFILE_IPV6>]:8080/python/devfile.yaml` (deploy test infra with `./scripts/test-ipv6-validation.sh`)
+  - IPv6 devfile server: `http://[fd02::3823]:8080/nodejs/devfile.yaml` and `http://[fd02::3823]:8080/python/devfile.yaml` (deploy with `./scripts/test-ipv6-validation.sh`; get IP via `oc get svc devfile-server -n che-test -o jsonpath='{.spec.clusterIPs[0]}'`)
 
 ## License
 

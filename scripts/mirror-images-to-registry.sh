@@ -389,7 +389,11 @@ if [ "${MODE}" = "full" ]; then
     # Required by OLM CatalogSource created by chectl (devworkspace-operator-index:next)
     "quay.io/devfile/devworkspace-operator-index:next"
     "quay.io/devfile/devworkspace-controller:next"
+    # Che operator pins devworkspace-webhook to sha-*; mirror so IPv6 cluster can pull
+    "quay.io/devfile/devworkspace-controller:sha-9b46583"
     "quay.io/devfile/project-clone:next"
+    # DWO pins project-clone init container to sha-*; mirror for IPv6 workspace creation
+    "quay.io/devfile/project-clone:sha-9b46583"
     "quay.io/devfile/universal-developer-image:ubi9-latest"
     # Default editor (CheCluster defaultEditor: che-incubator/che-code/latest)
     "quay.io/che-incubator/che-code:latest"

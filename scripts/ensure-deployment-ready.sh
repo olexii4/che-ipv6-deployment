@@ -80,7 +80,11 @@ patch_deployments_in_namespace() {
 
 if [ "$GATEWAY_PATCH_ONLY" = true ]; then
     echo "=== Patching workspace Deployments (che-gateway runAsNonRoot) ==="
-    patch_workspace_gateway_deployments
+    # Che routing controller overwrites the patch; retry to increase chance of persistence
+    for _ in 1 2 3 4 5; do
+        patch_workspace_gateway_deployments
+        sleep 2
+    done
     echo "Done."
     exit 0
 fi
@@ -166,9 +170,12 @@ done
 
 # 4b. Patch workspace Deployments: che-gateway sidecar has runAsNonRoot:true from Che routing controller
 # but the Traefik image runs as root. DevWorkspaceOperatorConfig runAsNonRoot:false doesn't apply to gateway.
-# Directly patch Deployments that have a che-gateway container.
+# Directly patch Deployments that have a che-gateway container. Retry a few times (controller may overwrite).
 echo "Patching workspace Deployments (che-gateway runAsNonRoot)..."
-patch_workspace_gateway_deployments
+for _ in 1 2 3; do
+    patch_workspace_gateway_deployments
+    sleep 2
+done
 
 # 5. Wait for devworkspace-webhook to have endpoints (workspace creation will fail otherwise)
 if [ "$NO_WAIT" = false ]; then
