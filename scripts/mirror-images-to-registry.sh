@@ -392,11 +392,13 @@ if [ "${MODE}" = "full" ]; then
     # Che operator pins devworkspace-webhook to sha-*; mirror so IPv6 cluster can pull
     "quay.io/devfile/devworkspace-controller:sha-9b46583"
     "quay.io/devfile/devworkspace-controller:sha-4410b61"
+    "quay.io/devfile/devworkspace-controller:sha-9415b15"
     "quay.io/devfile/project-clone:next"
     # DWO pins project-clone init container to sha-* (same commit as devworkspace-controller)
     # When adding new devworkspace-controller:sha-*, also add project-clone:sha-* with same tag
     "quay.io/devfile/project-clone:sha-9b46583"
     "quay.io/devfile/project-clone:sha-4410b61"
+    "quay.io/devfile/project-clone:sha-9415b15"
     "quay.io/devfile/universal-developer-image:ubi9-latest"
     # Default editor (CheCluster defaultEditor: che-incubator/che-code/latest)
     "quay.io/che-incubator/che-code:latest"

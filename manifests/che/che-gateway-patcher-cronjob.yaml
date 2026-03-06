@@ -8,8 +8,8 @@
 #
 # CronJob that patches workspace Deployments to fix che-gateway runAsNonRoot.
 # The Che routing controller injects che-gateway with runAsNonRoot:true but
-# the Traefik image runs as root. This job runs every 5 minutes to re-apply
-# the patch when the controller overwrites it.
+# the Traefik image runs as root. This job runs every 1 minute to re-apply
+# the patch when the controller overwrites it (faster = less window for failure).
 #
 # Apply with: kubectl apply -f manifests/che/che-gateway-patcher-cronjob.yaml -n eclipse-che
 #
@@ -56,7 +56,7 @@ metadata:
   name: che-gateway-patcher
   namespace: eclipse-che
 spec:
-  schedule: "*/5 * * * *"
+  schedule: "*/1 * * * *"   # Every 1 min (Che controller overwrites patch; minimizes failure window)
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   concurrencyPolicy: Forbid

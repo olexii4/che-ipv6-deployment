@@ -34,6 +34,25 @@ Then delete the stuck workspace in the dashboard and create a new one. Ephemeral
 ```
 Then retry. The deploy script now triggers this fallback automatically after ~3 minutes if che-gateway is missing.
 
+## Issue: "Could not reach devfile at Network is unreachable" (POST /api/factory/resolver 500)
+
+**Symptom:** Factory resolver returns 500 with `{"message":"Could not reach devfile at Network is unreachable"}` when creating a workspace from a devfile URL.
+
+**Cause:** che-server runs in an IPv6-only cluster and cannot reach external URLs (GitHub, registry.devfile.io, raw.githubusercontent.com) without a proxy.
+
+**Solution 1 – Add proxy:** Run the fix script to patch CheCluster with cheServer.proxy from kubeconfig:
+```bash
+./scripts/fix-che-server-proxy.sh --kubeconfig ~/ostest-kubeconfig.yaml
+```
+Then restart che-server: `oc delete pod -n eclipse-che -l app.kubernetes.io/name=che-server`
+
+**Solution 2 – Use in-cluster devfile server:** For the devfile server deployed by `test-ipv6-validation.sh`, use the **Kubernetes DNS URL** (not the IPv6 literal) so che-server can reach it without proxy:
+```
+http://devfile-server.che-test.svc.cluster.local:8080/nodejs/devfile.yaml
+http://devfile-server.che-test.svc.cluster.local:8080/python/devfile.yaml
+```
+The IPv6 literal `http://[fd02::...]:8080/...` may fail; the DNS name works from any pod in the cluster.
+
 ## Issue: Cannot access Che dashboard
 
 **Solution:** Use HTTP proxy as described in the README (Step 4: Access Eclipse Che Dashboard). Launch Chrome with the proxy from the deployment output.
@@ -211,9 +230,11 @@ Failed to pull image "quay.io/devfile/devworkspace-controller:sha-4410b61": mani
 Failed to pull image "quay.io/devfile/project-clone:sha-4410b61": manifest unknown
 ```
 
-**Cause:** The DevWorkspace Operator pins both `devworkspace-controller` and `project-clone` to the same commit-based tag (e.g. `sha-4410b61`). When DWO version changes, the sha tag changes. The cluster cannot reach quay.io (IPv6-only). The ImageTagMirrorSet redirects to the local registry, but these exact tags must be mirrored.
+**Cause:** The DevWorkspace Operator pins both `devworkspace-controller` and `project-clone` to commit-based tags (e.g. `sha-4410b61`). When DWO updates, the sha changes. The cluster cannot reach quay.io (IPv6-only). The ImageTagMirrorSet redirects to the local registry, but these tags must be mirrored.
 
-**Solution:** Re-run the mirror script with `--mode full`. The mirror script includes `devworkspace-controller:sha-*` and `project-clone:sha-*` (sha-9b46583, sha-4410b61). When DWO updates, add the new sha for both images in `scripts/mirror-images-to-registry.sh` and re-mirror. Run from a host that can reach both quay.io and the cluster registry (use kubeconfig proxy):
+**Prevention:** Run `ensure-deployment-ready.sh` (runs at deploy end). It pins **project-clone** via DevWorkspaceOperatorConfig to `quay.io/devfile/project-clone:sha-4410b61`, so workspace init containers always use a mirrored tag regardless of DWO updates. The devworkspace-webhook (controller) image still comes from the DWO bundle; to pin it, use `--devworkspace-bundle quay.io/devfile/devworkspace-operator-bundle@sha256:...` when deploying.
+
+**Solution (if project-clone still fails):** Re-run the mirror script with `--mode full`. The mirror script includes `devworkspace-controller:sha-*` and `project-clone:sha-*` (sha-9b46583, sha-4410b61, sha-9415b15). When DWO updates, add the new sha for both images in `scripts/mirror-images-to-registry.sh` and re-mirror. Run from a host that can reach both quay.io and the cluster registry (use kubeconfig proxy):
 ```bash
 ./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
 ```
@@ -232,6 +253,29 @@ Then delete the failed workspace in the dashboard and create a new one.
 ```
 The mirror script extracts `ubi8/nodejs-18:latest` and `ubi8/python-39:latest` from `manifests/test-infrastructure/`. Then delete the failed workspace and create a new one.
 
+## Issue: "FailedPostStartHook" / "postStart hook failed with an unknown error"
+
+**Symptom:** Workspace fails with:
+```
+Error creating DevWorkspace deployment: Detected unrecoverable event FailedPostStartHook: [postStart hook] failed with an unknown error
+```
+
+**Cause:** The che-code editor or UDI runs a postStart hook (e.g. fetching extensions from open-vsx.org). On IPv6-only clusters, workspace pods cannot reach external URLs without a proxy.
+
+**Solution 1 – Cluster proxy (persists):** Patch the cluster Proxy CR so workspace pods get HTTP_PROXY automatically:
+```bash
+PROXY=$(grep -m1 'proxy-url:' ~/ostest-kubeconfig.yaml | awk '{print $2}' | sed 's|/$||')
+oc patch proxy cluster --type=merge -p "{\"spec\":{\"httpProxy\":\"${PROXY}/\",\"httpsProxy\":\"${PROXY}/\",\"noProxy\":\"localhost,127.0.0.1,.cluster.local,.svc,.metalkube.org,virthost.ostest.test.metalkube.org,fd02::/112\"}}"
+```
+
+**Solution 2 – DevWorkspaceOperatorConfig (Che may revert):** Run the fix script, then delete the failed workspace and create a new one:
+```bash
+./scripts/fix-workspace-proxy.sh --kubeconfig ~/ostest-kubeconfig.yaml
+```
+If FailedPostStartHook returns, run this again right before creating a workspace.
+
+**Debug:** Add `controller.devfile.io/debug-start: "true"` to the DevWorkspace to leave failed pod resources; then `oc logs <pod> -c <container>` or check `/tmp/poststart-stderr.txt` in the container.
+
 ## Issue: "container has runAsNonRoot and image will run as root" (che-gateway in workspace pod)
 
 **Symptom:** Workspace pod fails with:
@@ -249,7 +293,7 @@ For a quick fix without other steps, use `--gateway-patch-only`:
 ```bash
 ./scripts/ensure-deployment-ready.sh --kubeconfig ~/ostest-kubeconfig.yaml --gateway-patch-only
 ```
-The deploy script also deploys a **CronJob** (`che-gateway-patcher`) that runs every 5 minutes to re-apply the patch when the Che routing controller overwrites it. On IPv6-only clusters, mirror `registry.redhat.io/openshift4/ose-cli` first or the CronJob pod will fail to start. To deploy the CronJob manually:
+The deploy script deploys a **CronJob** (`che-gateway-patcher`) that runs every 1 minute to re-apply the patch when the Che routing controller overwrites it. On IPv6-only clusters, mirror `registry.redhat.io/openshift4/ose-cli` first or the CronJob pod will fail to start. To deploy the CronJob manually:
 ```bash
 kubectl apply -f manifests/che/che-gateway-patcher-cronjob.yaml -n eclipse-che
 ```

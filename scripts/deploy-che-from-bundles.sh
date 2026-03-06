@@ -509,48 +509,51 @@ fi
 CLUSTER_PROXY_HTTP=$(kubectl get proxy cluster -o jsonpath='{.spec.httpProxy}' 2>/dev/null || echo "")
 CLUSTER_PROXY_HTTPS=$(kubectl get proxy cluster -o jsonpath='{.spec.httpsProxy}' 2>/dev/null || echo "")
 CLUSTER_NO_PROXY=$(kubectl get proxy cluster -o jsonpath='{.spec.noProxy}' 2>/dev/null || echo "")
+# Fallback: ostest clusters have proxy in kubeconfig but not in cluster Proxy CR
+KUBECONFIG_PROXY=""
+if [ -z "$CLUSTER_PROXY_HTTP" ] && [ -z "$CLUSTER_PROXY_HTTPS" ] && [ -n "$KUBECONFIG_PATH" ] && [ -f "$KUBECONFIG_PATH" ]; then
+    KUBECONFIG_PROXY=$(grep -m1 'proxy-url:' "$KUBECONFIG_PATH" 2>/dev/null | awk '{print $2}' | sed 's|/$||' || true)
+fi
 
 # Devfile registry: IPv6-only clusters use internal registry + air-gap samples only.
-# No cluster-wide proxy: IPv4 proxy does not work from IPv6-only pods.
-# cheServer.proxy: only set when cluster Proxy CR is explicitly configured (e.g. dual-stack).
-# We do NOT use kubeconfig proxy-url for cheServer.proxy (it would block Gitea/internal traffic).
+# cheServer.proxy: from cluster Proxy CR, or kubeconfig proxy-url (ostest fallback) for factory resolver.
+# nonProxyHosts excludes .svc so in-cluster devfile server (devfile-server.che-test.svc) works without proxy.
 CHE_SERVER_PROXY_LINE=""
 PROXY_URL_RAW="${CLUSTER_PROXY_HTTP:-$CLUSTER_PROXY_HTTPS}"
-if [ -n "$CLUSTER_PROXY_HTTP" ] || [ -n "$CLUSTER_PROXY_HTTPS" ]; then
-    log_info "Cluster-wide proxy detected - enabling cheServer.proxy"
-    log_info "Devfile registry: internal only (IPv6 pods cannot reach registry.devfile.io)"
-
-    # Build explicit cheServer.proxy so che-server (factory resolver) may use proxy on dual-stack
-    # Cluster Proxy Status can lag; explicit CR overrides ensure proxy is applied immediately
-    if [ -n "$PROXY_URL_RAW" ]; then
-        PROXY_URL_RAW="${PROXY_URL_RAW%/}"
-        PROXY_URL_BASE=$(echo "$PROXY_URL_RAW" | sed -E 's/:([0-9]+)\/?$//')
-        PROXY_PORT=$(echo "$PROXY_URL_RAW" | sed -En 's/.*:([0-9]+)\/?$/\1/p')
-        if [ -z "$PROXY_PORT" ]; then
-            [ "${PROXY_URL_RAW#https:}" != "$PROXY_URL_RAW" ] && PROXY_PORT="443" || PROXY_PORT="80"
-        fi
-        # nonProxyHosts: use cluster noProxy if set, else defaults (comma-separated -> YAML array)
-        if [ -n "$CLUSTER_NO_PROXY" ]; then
-            NO_PROXY_STR="$CLUSTER_NO_PROXY"
-        else
-            NO_PROXY_STR="localhost,127.0.0.1,.cluster.local,.svc,.metalkube.org,virthost.ostest.test.metalkube.org,fd02::/112,registry.devfile.io,.devfile.io,github.com,raw.githubusercontent.com,githubusercontent.com"
-        fi
-        NON_PROXY_YAML=""
-        IFS=',' read -ra PARTS <<< "$NO_PROXY_STR"
-        for h in "${PARTS[@]}"; do
-            h=$(echo "$h" | tr -d ' ')
-            [ -z "$h" ] && continue
-            NON_PROXY_YAML="${NON_PROXY_YAML}
+[ -z "$PROXY_URL_RAW" ] && PROXY_URL_RAW="$KUBECONFIG_PROXY"
+if [ -n "$PROXY_URL_RAW" ]; then
+    if [ -n "$CLUSTER_PROXY_HTTP" ] || [ -n "$CLUSTER_PROXY_HTTPS" ]; then
+        log_info "Cluster-wide proxy detected - enabling cheServer.proxy"
+    else
+        log_info "Using kubeconfig proxy for cheServer.proxy (factory resolver)"
+    fi
+    log_info "Devfile: use http://devfile-server.che-test.svc.cluster.local:8080/... for in-cluster (no proxy)"
+    PROXY_URL_RAW="${PROXY_URL_RAW%/}"
+    PROXY_URL_BASE=$(echo "$PROXY_URL_RAW" | sed -E 's/:([0-9]+)\/?$//')
+    PROXY_PORT=$(echo "$PROXY_URL_RAW" | sed -En 's/.*:([0-9]+)\/?$/\1/p')
+    if [ -z "$PROXY_PORT" ]; then
+        [ "${PROXY_URL_RAW#https:}" != "$PROXY_URL_RAW" ] && PROXY_PORT="443" || PROXY_PORT="80"
+    fi
+    if [ -n "$CLUSTER_NO_PROXY" ]; then
+        NO_PROXY_STR="$CLUSTER_NO_PROXY"
+    else
+        NO_PROXY_STR="localhost,127.0.0.1,.cluster.local,.svc,.metalkube.org,virthost.ostest.test.metalkube.org,fd02::/112,devfile-server.che-test.svc,registry.devfile.io,.devfile.io,github.com,raw.githubusercontent.com,githubusercontent.com"
+    fi
+    NON_PROXY_YAML=""
+    IFS=',' read -ra PARTS <<< "$NO_PROXY_STR"
+    for h in "${PARTS[@]}"; do
+        h=$(echo "$h" | tr -d ' ')
+        [ -z "$h" ] && continue
+        NON_PROXY_YAML="${NON_PROXY_YAML}
           - ${h}"
-        done
-        CHE_SERVER_PROXY_LINE="
+    done
+    CHE_SERVER_PROXY_LINE="
       proxy:
         url: ${PROXY_URL_BASE}
         port: \"${PROXY_PORT}\"
         nonProxyHosts:${NON_PROXY_YAML}"
-    fi
 else
-    log_warn "No cluster-wide proxy detected - cheServer.proxy disabled"
+    log_warn "No proxy - factory resolver will fail for external URLs. Use devfile-server.che-test.svc for in-cluster."
 fi
 
 # Apply CheCluster CR from template
@@ -568,6 +571,22 @@ kubectl apply -f "$TEMP_DIR/checluster.yaml"
 
 log_success "CheCluster CR created"
 echo
+
+#######################################
+# Step 4a: Patch cluster Proxy so workspace pods get HTTP_PROXY (fixes FailedPostStartHook)
+#######################################
+if [ -n "$PROXY_URL_RAW" ]; then
+    CLUSTER_HTTP=$(kubectl get proxy cluster -o jsonpath='{.spec.httpProxy}' 2>/dev/null || echo "")
+    if [ -z "$CLUSTER_HTTP" ]; then
+        log_info "Patching cluster Proxy (workspace pods need proxy for postStart/open-vsx)"
+        NO_PROXY="localhost,127.0.0.1,.cluster.local,.svc,.metalkube.org,virthost.ostest.test.metalkube.org,fd02::/112"
+        if kubectl patch proxy cluster --type=merge -p "{\"spec\":{\"httpProxy\":\"${PROXY_URL_RAW}/\",\"httpsProxy\":\"${PROXY_URL_RAW}/\",\"noProxy\":\"${NO_PROXY}\"}}" 2>/dev/null; then
+            log_success "Cluster Proxy patched"
+        else
+            log_warn "Cluster Proxy patch failed (may need cluster-admin). Run fix-workspace-proxy.sh if FailedPostStartHook."
+        fi
+    fi
+fi
 
 #######################################
 # Step 4b: Patch images for IPv6 (local registry)
@@ -660,6 +679,9 @@ for i in {1..60}; do
     if [ -n "$CHE_URL" ] && [ "$CHE_PHASE" = "Active" ]; then
         log_success "Eclipse Che is ready!"
         log_success "Che URL: $CHE_URL"
+        # Patch che-gateway before breaking - catches workspaces created just as Che becomes ready
+        ENSURE_SCRIPT="${SCRIPT_DIR}/ensure-deployment-ready.sh"
+        [ -x "$ENSURE_SCRIPT" ] && "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null || true
         break
     fi
 
@@ -741,22 +763,22 @@ if [ -n "$CHE_URL_FINAL" ] && [ -x "$ENSURE_SCRIPT" ]; then
     else
         log_warn "ensure-deployment-ready had issues. Login/workspace-create may need manual fix."
     fi
-    # Re-run gateway patch at 20s and 120s to catch workspaces created during/after deploy
+    # Re-run gateway patch at 20s, 60s, 120s, 180s to catch workspaces created during/after deploy
     PREV=0
-    for WAIT in 20 120; do
+    for WAIT in 20 60 120 180; do
         log_info "Re-running che-gateway patch in ${WAIT}s (catches new workspaces)..."
         sleep $((WAIT - PREV))
         PREV=$WAIT
-        if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null; then
-            log_success "Gateway patch re-applied"
-        fi
+        "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null || true
     done
-    # Deploy CronJob to patch che-gateway runAsNonRoot every 5 min (Che controller may overwrite)
+    # Deploy CronJob to patch che-gateway runAsNonRoot every 1 min (Che controller may overwrite)
     CRONJOB_YAML="${SCRIPT_DIR}/../manifests/che/che-gateway-patcher-cronjob.yaml"
     if [ -f "$CRONJOB_YAML" ]; then
         log_info "Deploying che-gateway-patcher CronJob (recurring fix for runAsNonRoot)..."
         if sed "s/namespace: eclipse-che/namespace: ${NAMESPACE}/g" "$CRONJOB_YAML" | kubectl apply -f - 2>/dev/null; then
-            log_success "CronJob deployed (runs every 5 min)"
+            log_success "CronJob deployed (runs every 1 min)"
+            kubectl delete job che-gateway-patcher-init -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+            kubectl create job -n "$NAMESPACE" --from=cronjob/che-gateway-patcher che-gateway-patcher-init 2>/dev/null || true  # Run once immediately
         else
             log_warn "CronJob apply failed (may need ose-cli image mirrored on IPv6)"
         fi
@@ -908,6 +930,9 @@ echo "  ./scripts/mirror-images-to-registry.sh --kubeconfig $KUBECONFIG_PATH --m
 echo "  (Then delete the failed workspace and create a new one)"
 echo "If a new workspace fails with 'runAsNonRoot' (che-gateway), run:"
 echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH --gateway-patch-only"
+echo "If workspace fails with 'FailedPostStartHook' (postStart/open-vsx), run:"
+echo "  ./scripts/fix-workspace-proxy.sh --kubeconfig $KUBECONFIG_PATH"
+echo "  (Then delete the failed workspace and create a new one)"
 echo
 echo "To check operator logs:"
 echo "  kubectl logs -n $NAMESPACE -l app.kubernetes.io/name=che-operator -f"

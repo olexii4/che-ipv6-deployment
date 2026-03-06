@@ -132,15 +132,42 @@ else
     echo "  anyuid SCC not found (non-OpenShift?), skipping"
 fi
 
-# 3b. DevWorkspaceOperatorConfig - runAsNonRoot:false for workspace containers.
-# Che routing controller still hardcodes runAsNonRoot:true for che-gateway, so we also patch Deployments (step 4b).
+# 3b. DevWorkspaceOperatorConfig - runAsNonRoot:false + projectClone.image pinned.
+# Pinning projectClone.image prevents ImagePullBackOff when DWO updates to a new sha-* tag we haven't mirrored.
+# Use sha-4410b61 (known to work; mirror script includes it). Che routing controller still hardcodes
+# runAsNonRoot:true for che-gateway, so we also patch Deployments (step 4b).
 if oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" &>/dev/null; then
+    # runAsNonRoot
     CUR=$(oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" -o jsonpath='{.config.workspace.containerSecurityContext.runAsNonRoot}' 2>/dev/null || echo "")
     if [ "$CUR" != "false" ]; then
         if oc patch devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" --type=merge -p '{"config":{"workspace":{"containerSecurityContext":{"runAsNonRoot":false}}}}' 2>/dev/null; then
             echo "  DevWorkspaceOperatorConfig: set containerSecurityContext.runAsNonRoot=false"
         else
             echo "  WARN: Could not patch devworkspace-config (Che operator may own it)"
+        fi
+    fi
+    # projectClone.image - pin to mirrored tag so DWO updates don't require re-mirroring
+    PINNED_PROJECT_CLONE="quay.io/devfile/project-clone:sha-4410b61"
+    CUR_IMG=$(oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" -o jsonpath='{.config.workspace.projectClone.image}' 2>/dev/null || echo "")
+    if [ "$CUR_IMG" != "$PINNED_PROJECT_CLONE" ]; then
+        if oc patch devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" --type=merge -p "{\"config\":{\"workspace\":{\"projectClone\":{\"image\":\"$PINNED_PROJECT_CLONE\"}}}}" 2>/dev/null; then
+            echo "  DevWorkspaceOperatorConfig: pinned projectClone.image=$PINNED_PROJECT_CLONE"
+        else
+            echo "  WARN: Could not patch projectClone.image"
+        fi
+    fi
+    # routing.proxyConfig - workspace pods need proxy to reach open-vsx.org etc. (fixes FailedPostStartHook)
+    KUBECONFIG_PROXY=$(grep -m1 'proxy-url:' "$KUBECONFIG_FILE" 2>/dev/null | awk '{print $2}' | sed 's|/$||' || true)
+    if [ -n "$KUBECONFIG_PROXY" ]; then
+        PROXY_BASE=$(echo "$KUBECONFIG_PROXY" | sed -E 's|^https?://||')
+        NO_PROXY="localhost,127.0.0.1,.cluster.local,.svc,.metalkube.org,virthost.ostest.test.metalkube.org,fd02::/112"
+        CUR_PROXY=$(oc get devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" -o jsonpath='{.config.routing.proxyConfig.httpProxy}' 2>/dev/null || echo "")
+        if [ "$CUR_PROXY" != "http://${PROXY_BASE}/" ]; then
+            if oc patch devworkspaceoperatorconfig devworkspace-config -n "$NAMESPACE" --type=merge -p "{\"config\":{\"routing\":{\"proxyConfig\":{\"httpProxy\":\"http://${PROXY_BASE}/\",\"httpsProxy\":\"http://${PROXY_BASE}/\",\"noProxy\":\"${NO_PROXY}\"}}}}" 2>/dev/null; then
+                echo "  DevWorkspaceOperatorConfig: set proxyConfig (fixes postStart/open-vsx on IPv6)"
+            else
+                echo "  WARN: Could not patch proxyConfig"
+            fi
         fi
     fi
 fi
@@ -176,6 +203,18 @@ for _ in 1 2 3 4 5; do
     patch_workspace_gateway_deployments
     sleep 2
 done
+
+# 4c. Deploy CronJob to re-apply che-gateway patch every 2 min (Che controller overwrites it)
+CRONJOB_YAML="${SCRIPT_DIR}/../manifests/che/che-gateway-patcher-cronjob.yaml"
+if [ -f "$CRONJOB_YAML" ]; then
+    if sed "s/namespace: eclipse-che/namespace: ${NAMESPACE}/g" "$CRONJOB_YAML" | oc apply -f - 2>/dev/null; then
+        echo "  che-gateway-patcher CronJob deployed (runs every 2 min)"
+        oc delete job che-gateway-patcher-init -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+        oc create job -n "$NAMESPACE" --from=cronjob/che-gateway-patcher che-gateway-patcher-init 2>/dev/null || true  # Run once immediately
+    else
+        echo "  WARN: CronJob apply failed (may need ose-cli image mirrored on IPv6)"
+    fi
+fi
 
 # 5. Wait for devworkspace-webhook to have endpoints (workspace creation will fail otherwise)
 if [ "$NO_WAIT" = false ]; then
