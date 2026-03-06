@@ -39,10 +39,9 @@ DASHBOARD_IMAGE=""
 CHE_SERVER_IMAGE=""
 KUBECONFIG_PATH=""
 SKIP_DEVWORKSPACE=false
-# Default: false. Air-gap secret causes Che operator reconcile loop (non-deterministic
-# volume mount order) -> InstallOrUpdateFailed -> DevWorkspaceRouting never ready.
-# deploy-che-ipv6-chectl works because it never creates the air-gap secret.
-# Use --airgap-samples to enable when che-operator is fixed to sort secret keys.
+# Default: false. When true, air-gap samples are added AFTER Che is deployed (avoids
+# reconcile loop: secret created during deploy causes InstallOrUpdateFailed).
+# Algorithm: deploy Che first with ConfigMap (GitHub URLs), then add air-gap Secret.
 AIRGAP_SAMPLES=false
 # Deploy devfile HTTP server for IPv6 testing (Node.js, Python devfiles at http://[IPv6]:8080/...)
 DEPLOY_DEVFILE_SERVER=false
@@ -122,7 +121,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-devworkspace              Skip DevWorkspace Operator installation"
             echo "  --devworkspace-bundle <image>    DevWorkspace bundle image (default: quay.io/devfile/devworkspace-operator-bundle:next)"
             echo "  --che-bundle <image>             Che bundle image (default: quay.io/eclipse/eclipse-che-openshift-opm-bundles:next)"
-            echo "  --airgap-samples                 Enable air-gap samples (may cause InstallOrUpdateFailed until operator fix)"
+            echo "  --airgap-samples                 Enable air-gap samples (added after Che deploys, avoids reconcile loop)"
             echo "  --no-airgap-samples              Disable air-gap samples (default, matches chectl behavior)"
             echo "  --deploy-devfile-server         Deploy devfile HTTP server for IPv6 testing (Node.js, Python devfiles)"
             echo "  --help                           Show this help message"
@@ -295,82 +294,28 @@ echo
 SAMPLES_JSON="${MANIFEST_DIR}/che/air-gap-samples.json"
 
 #######################################
-# Step 2c: Create air-gap samples Secret (samples run without proxy)
+# Step 2c: Air-gap samples - DEFERRED until after Che is deployed
 #######################################
-# Prepares samples from air-gap-samples.json: clones repos, zips them,
-# transforms URLs to dashboard API (devfile/project download). Mounts at
-# /public/dashboard/devfile-registry/air-gap. Dashboard serves via /dashboard/api/airgap-sample/*
-# so workspace creation does not need GitHub/proxy access.
+# Algorithm: Deploy Che first (with ConfigMap/GitHub URLs), then add air-gap Secret.
+# Creating the secret before deploy causes operator reconcile loop -> InstallOrUpdateFailed.
+# Air-gap secret will be created in Step 6b after Che is ready.
 
 AIRGAP_SECRET_CREATED=false
-if [ "$AIRGAP_SAMPLES" = true ] && [ -f "$SAMPLES_JSON" ]; then
-    log_info "Step 2c: Preparing air-gap samples (no proxy needed for sample workspaces)"
-    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-    AIRGAP_DIR="${REPO_ROOT}/build/air-gap"
-    PREPARE_SCRIPT="${SCRIPT_DIR}/prepare-airgap-from-samples.sh"
-
-    if [ -x "$PREPARE_SCRIPT" ]; then
-        if (cd "$REPO_ROOT" && "$PREPARE_SCRIPT" -i "$SAMPLES_JSON" -o "$AIRGAP_DIR") 2>/dev/null; then
-            if [ -f "${AIRGAP_DIR}/index.json" ] && [ -n "$(ls -A "$AIRGAP_DIR" 2>/dev/null)" ]; then
-                # Substitute CHE_DASHBOARD_INTERNAL_URL with pod env value (matches Che operator)
-                # http://che-dashboard.<namespace>.svc:8080
-                CHE_DASHBOARD_INTERNAL_URL="http://che-dashboard.${NAMESPACE}.svc:8080"
-                for f in "${AIRGAP_DIR}"/index.json "${AIRGAP_DIR}"/*-devfile.yaml; do
-                    if [ -f "$f" ]; then
-                        sed "s|CHE_DASHBOARD_INTERNAL_URL|${CHE_DASHBOARD_INTERNAL_URL}|g" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
-                    fi
-                done
-                log_info "Creating che-dashboard-airgap Secret (mounts into /public/dashboard/devfile-registry/air-gap)"
-                # CRITICAL: Use sorted file order. Non-deterministic order causes operator to generate
-                # different volume mount order each reconcile -> "object has been modified" conflict ->
-                # InstallOrUpdateFailed and che-server never deploys (Route POST:/api/.../provision not found)
-                FROM_FILE_ARGS=()
-                while IFS= read -r f; do
-                    [ -f "$f" ] && FROM_FILE_ARGS+=(--from-file="$(basename "$f")=$f")
-                done < <(find "${AIRGAP_DIR}" -maxdepth 1 -type f | sort)
-                if [ ${#FROM_FILE_ARGS[@]} -gt 0 ]; then
-                    kubectl create secret generic che-dashboard-airgap \
-                        "${FROM_FILE_ARGS[@]}" \
-                        -n "$NAMESPACE" \
-                        --dry-run=client -o yaml | kubectl apply -f -
-                else
-                    kubectl create secret generic che-dashboard-airgap \
-                        --from-file="${AIRGAP_DIR}/" \
-                        -n "$NAMESPACE" \
-                        --dry-run=client -o yaml | kubectl apply -f -
-                fi
-                kubectl label secret che-dashboard-airgap \
-                    app.kubernetes.io/part-of=che.eclipse.org \
-                    app.kubernetes.io/component=che-dashboard-secret \
-                    -n "$NAMESPACE" --overwrite
-                kubectl annotate secret che-dashboard-airgap \
-                    che.eclipse.org/mount-as=subpath \
-                    che.eclipse.org/mount-path=/public/dashboard/devfile-registry/air-gap \
-                    -n "$NAMESPACE" --overwrite
-                AIRGAP_SECRET_CREATED=true
-                log_success "Air-gap samples Secret created (samples use dashboard API, no GitHub URLs)"
-            else
-                log_warn "Air-gap output empty, skipping Secret creation"
-            fi
-        else
-            log_warn "prepare-airgap-from-samples failed (network required for git clone). Samples will need proxy."
-        fi
-    else
-        log_warn "prepare-airgap-from-samples.sh not found or not executable, skipping air-gap Secret"
-    fi
+if [ "$AIRGAP_SAMPLES" = true ]; then
+    log_info "Step 2c: Air-gap samples deferred until after Che is deployed (avoids reconcile loop)"
 elif [ "$AIRGAP_SAMPLES" = false ]; then
     log_info "Step 2c: Skipping air-gap samples (--no-airgap-samples)"
 fi
 echo
 
 #######################################
-# Step 2b: Create Getting Started Samples ConfigMap (fallback only)
+# Step 2b: Create Getting Started Samples ConfigMap
 #######################################
-# When air-gap Secret exists, dashboard uses it (zip/dashboard API). Skip ConfigMap.
-# When air-gap fails or --no-airgap-samples, use ConfigMap with GitHub URLs as fallback.
+# Used for initial Che deployment. Contains GitHub URLs for samples.
+# When --airgap-samples: air-gap Secret added later (Step 6b) will take precedence.
 
-if [ "$AIRGAP_SECRET_CREATED" = false ] && [ -f "$SAMPLES_JSON" ]; then
-    log_info "Step 2b: Creating getting-started-samples ConfigMap (GitHub URLs fallback)"
+if [ -f "$SAMPLES_JSON" ]; then
+    log_info "Step 2b: Creating getting-started-samples ConfigMap (samples for initial deploy)"
     kubectl create configmap getting-started-samples \
         --from-file=samples.json="$SAMPLES_JSON" \
         -n "$NAMESPACE" \
@@ -796,11 +741,81 @@ if [ -n "$CHE_URL_FINAL" ] && [ -x "$ENSURE_SCRIPT" ]; then
     else
         log_warn "ensure-deployment-ready had issues. Login/workspace-create may need manual fix."
     fi
-    # Re-run gateway patch after 20s to catch workspaces created during the first run
-    log_info "Re-running che-gateway patch in 20s (catches new workspaces)..."
-    sleep 20
-    if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null; then
-        log_success "Gateway patch re-applied"
+    # Re-run gateway patch at 20s and 120s to catch workspaces created during/after deploy
+    PREV=0
+    for WAIT in 20 120; do
+        log_info "Re-running che-gateway patch in ${WAIT}s (catches new workspaces)..."
+        sleep $((WAIT - PREV))
+        PREV=$WAIT
+        if "$ENSURE_SCRIPT" --kubeconfig "$KUBECONFIG_PATH" --namespace "$NAMESPACE" --gateway-patch-only 2>/dev/null; then
+            log_success "Gateway patch re-applied"
+        fi
+    done
+    # Deploy CronJob to patch che-gateway runAsNonRoot every 5 min (Che controller may overwrite)
+    CRONJOB_YAML="${SCRIPT_DIR}/../manifests/che/che-gateway-patcher-cronjob.yaml"
+    if [ -f "$CRONJOB_YAML" ]; then
+        log_info "Deploying che-gateway-patcher CronJob (recurring fix for runAsNonRoot)..."
+        if sed "s/namespace: eclipse-che/namespace: ${NAMESPACE}/g" "$CRONJOB_YAML" | kubectl apply -f - 2>/dev/null; then
+            log_success "CronJob deployed (runs every 5 min)"
+        else
+            log_warn "CronJob apply failed (may need ose-cli image mirrored on IPv6)"
+        fi
+    fi
+    echo
+fi
+
+#######################################
+# Step 6b: Add air-gap samples Secret (after Che is deployed)
+#######################################
+# Deploy Che first, then add samples. Avoids reconcile loop during initial deploy.
+# Prepares samples from air-gap-samples.json, creates che-dashboard-airgap Secret.
+# Operator will reconcile and add volume to dashboard; pod restarts with samples.
+#
+if [ "$AIRGAP_SAMPLES" = true ] && [ -f "$SAMPLES_JSON" ]; then
+    log_info "Step 6b: Adding air-gap samples (Che is deployed, adding samples to dashboard)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    AIRGAP_DIR="${REPO_ROOT}/build/air-gap"
+    PREPARE_SCRIPT="${SCRIPT_DIR}/prepare-airgap-from-samples.sh"
+
+    if [ -x "$PREPARE_SCRIPT" ]; then
+        if (cd "$REPO_ROOT" && "$PREPARE_SCRIPT" -i "$SAMPLES_JSON" -o "$AIRGAP_DIR") 2>/dev/null; then
+            if [ -f "${AIRGAP_DIR}/index.json" ] && [ -n "$(ls -A "$AIRGAP_DIR" 2>/dev/null)" ]; then
+                CHE_DASHBOARD_INTERNAL_URL="http://che-dashboard.${NAMESPACE}.svc:8080"
+                for f in "${AIRGAP_DIR}"/index.json "${AIRGAP_DIR}"/*-devfile.yaml; do
+                    if [ -f "$f" ]; then
+                        sed "s|CHE_DASHBOARD_INTERNAL_URL|${CHE_DASHBOARD_INTERNAL_URL}|g" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+                    fi
+                done
+                log_info "Creating che-dashboard-airgap Secret (samples run without proxy)"
+                FROM_FILE_ARGS=()
+                while IFS= read -r f; do
+                    [ -f "$f" ] && FROM_FILE_ARGS+=(--from-file="$(basename "$f")=$f")
+                done < <(find "${AIRGAP_DIR}" -maxdepth 1 -type f | sort)
+                if [ ${#FROM_FILE_ARGS[@]} -gt 0 ]; then
+                    kubectl create secret generic che-dashboard-airgap \
+                        "${FROM_FILE_ARGS[@]}" \
+                        -n "$NAMESPACE" \
+                        --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl label secret che-dashboard-airgap \
+                        app.kubernetes.io/part-of=che.eclipse.org \
+                        app.kubernetes.io/component=che-dashboard-secret \
+                        -n "$NAMESPACE" --overwrite
+                    kubectl annotate secret che-dashboard-airgap \
+                        che.eclipse.org/mount-as=subpath \
+                        che.eclipse.org/mount-path=/public/dashboard/devfile-registry/air-gap \
+                        -n "$NAMESPACE" --overwrite
+                    log_success "Air-gap samples Secret created - dashboard will restart with samples"
+                else
+                    log_warn "Air-gap output empty, skipping Secret creation"
+                fi
+            else
+                log_warn "prepare-airgap-from-samples output empty, skipping Secret"
+            fi
+        else
+            log_warn "prepare-airgap-from-samples failed (network required for git clone)"
+        fi
+    else
+        log_warn "prepare-airgap-from-samples.sh not found or not executable"
     fi
     echo
 fi
@@ -888,6 +903,9 @@ echo
 log_info "=== Additional Commands ==="
 echo "If login or workspace creation fails, run:"
 echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH"
+echo "If workspace fails with 'Init Container project-clone ImagePullBackOff', run:"
+echo "  ./scripts/mirror-images-to-registry.sh --kubeconfig $KUBECONFIG_PATH --mode full"
+echo "  (Then delete the failed workspace and create a new one)"
 echo "If a new workspace fails with 'runAsNonRoot' (che-gateway), run:"
 echo "  ./scripts/ensure-deployment-ready.sh --kubeconfig $KUBECONFIG_PATH --gateway-patch-only"
 echo

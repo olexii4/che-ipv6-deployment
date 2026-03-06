@@ -105,10 +105,12 @@ cd che-ipv6-deployment
 - Creates leader election RBAC for high availability
 - Deploys Che Operator with all required resources
 - Creates CheCluster custom resource with custom dashboard image
+- Deploys Eclipse Che first (with ConfigMap/GitHub URLs for samples)
 - Patches images for local registry (fix-image-pulls) - prevents ImagePullBackOff
 - Fixes OAuth redirect URI mismatch (fix-oauth-redirect) - prevents login errors
 - Re-patches DevWorkspace webhook after delay - ensures workspace creation works
 - Runs ensure-deployment-ready - applies SCC fix (anyuid for workspaces), patches che-gateway runAsNonRoot (Traefik runs as root), verifies login and workspace create will work
+- Adds air-gap samples Secret **after** Che is ready (`--airgap-samples`) - avoids reconcile loop during deploy
 - Optionally deploys devfile HTTP server (`--deploy-devfile-server`) - serves Node.js and Python devfiles over IPv6
 - Waits for all components to be ready
 
@@ -122,12 +124,12 @@ cd che-ipv6-deployment
 --skip-devworkspace              Skip DevWorkspace Operator installation
 --devworkspace-bundle <image>    DevWorkspace bundle image
 --che-bundle <image>             Che bundle image
---airgap-samples                 Enable air-gap samples (may cause InstallOrUpdateFailed)
+--airgap-samples                 Enable air-gap samples (added after Che deploys)
 --no-airgap-samples              Disable air-gap samples (default, matches chectl behavior)
 --deploy-devfile-server         Deploy devfile HTTP server for IPv6 testing (Node.js, Python)
 ```
 
-**Air-gap samples:** Disabled by default (`--no-airgap-samples`) to avoid Che operator reconcile loop (InstallOrUpdateFailed). Use `--airgap-samples` to enable—samples mount into dashboard and run without proxy; may cause InstallOrUpdateFailed until che-operator fixes secret key ordering. See [Troubleshooting](docs/troubleshooting.md#issue-installorupdatefailed--waiting-for-devworkspacerouting-controller-to-be-ready).
+**Air-gap samples:** Disabled by default (`--no-airgap-samples`). Use `--airgap-samples` to enable—samples are added **after** Che deploys (avoids reconcile loop). Algorithm: deploy Che first with ConfigMap (GitHub URLs), then add air-gap Secret once Che is ready; samples run without proxy.
 
 **After deployment completes, the script will show:**
 - ✅ Che URL (e.g., `https://eclipse-che-eclipse-che.apps.ostest...`)

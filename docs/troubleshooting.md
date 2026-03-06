@@ -170,25 +170,22 @@ envsubst < manifests/che/che-sa-project-permissions.yaml | oc apply -f -
 
 **Symptom:** CheCluster status is `InstallOrUpdateFailed`. Workspaces stay in "Starting" with message "Waiting for DevWorkspaceRouting controller to be ready". Operator logs show: `Operation cannot be fulfilled on deployments.apps "che-dashboard": the object has been modified`.
 
-**Cause:** The `che-dashboard-airgap` secret causes the Che operator to enter a reconcile loop. The operator iterates over secret keys in non-deterministic order (Go map), producing different volume mount order each reconcile → deployment spec drift → update conflicts.
+**Cause:** The `che-dashboard-airgap` secret can cause the Che operator to enter a reconcile loop. The operator iterates over secret keys in non-deterministic order (Go map), producing different volume mount order each reconcile → deployment spec drift → update conflicts.
 
-**Why deploy-che-ipv6-chectl works:** That script never creates the air-gap secret, so no reconcile loop and CheCluster can become Available.
+**Mitigation:** The deploy script now adds air-gap samples **after** Che is deployed (Step 6b). Algorithm: deploy Che first with ConfigMap (GitHub URLs), then add the Secret once Che is ready. This avoids the reconcile loop during initial deploy.
 
-**Solution:**
+**Solution (if you deployed with older script or manual secret):**
 
-1. **Redeploy with --no-airgap-samples (recommended):** The deploy script now defaults to `--no-airgap-samples`. If you previously deployed with air-gap, delete the secret and redeploy:
+1. **Delete the secret and redeploy:**
    ```bash
    oc delete secret che-dashboard-airgap -n eclipse-che
-   # Then redeploy or restart the Che operator to trigger reconcile
    oc delete pod -n eclipse-che -l app.kubernetes.io/name=che-operator --force --grace-period=0
    ```
 
-2. **Or deploy fresh with --no-airgap-samples:**
+2. **Or deploy fresh with --airgap-samples** (script now defers secret until after Che is ready):
    ```bash
-   ./scripts/deploy-che-from-bundles.sh --kubeconfig ~/ostest-kubeconfig.yaml --no-airgap-samples
+   ./scripts/deploy-che-from-bundles.sh --kubeconfig ~/ostest-kubeconfig.yaml --airgap-samples
    ```
-
-3. **If you need air-gap samples:** Use `--airgap-samples` and accept that CheCluster may stay InstallOrUpdateFailed until the che-operator is fixed to sort secret keys when building volume mounts.
 
 ## Issue: Workspace pod ImagePullBackOff for che-code (quay.io/che-incubator/che-code:latest)
 
@@ -210,17 +207,18 @@ Then delete the failed workspace in the dashboard and create a new one. The mirr
 
 **Symptom:** Workspace shows "Error creating DevWorkspace deployment: Init Container project-clone has state ImagePullBackOff", or devworkspace-webhook-server pods fail with:
 ```
-Failed to pull image "quay.io/devfile/devworkspace-controller:sha-9b46583": manifest unknown
-Failed to pull image "quay.io/devfile/project-clone:sha-9b46583": manifest unknown
+Failed to pull image "quay.io/devfile/devworkspace-controller:sha-4410b61": manifest unknown
+Failed to pull image "quay.io/devfile/project-clone:sha-4410b61": manifest unknown
 ```
 
-**Cause:** The DevWorkspace Operator pins images to commit-based tags (e.g. `sha-9b46583`). The cluster cannot reach quay.io (IPv6-only). The ImageTagMirrorSet redirects to the local registry, but these exact tags were never mirrored.
+**Cause:** The DevWorkspace Operator pins both `devworkspace-controller` and `project-clone` to the same commit-based tag (e.g. `sha-4410b61`). When DWO version changes, the sha tag changes. The cluster cannot reach quay.io (IPv6-only). The ImageTagMirrorSet redirects to the local registry, but these exact tags must be mirrored.
 
-**Solution:** Re-run the mirror script. The mirror script now includes `devworkspace-controller:sha-9b46583` and `project-clone:sha-9b46583` in full mode. Run from a host that can reach both quay.io and the cluster registry (use kubeconfig proxy):
+**Solution:** Re-run the mirror script with `--mode full`. The mirror script includes `devworkspace-controller:sha-*` and `project-clone:sha-*` (sha-9b46583, sha-4410b61). When DWO updates, add the new sha for both images in `scripts/mirror-images-to-registry.sh` and re-mirror. Run from a host that can reach both quay.io and the cluster registry (use kubeconfig proxy):
 ```bash
 ./scripts/mirror-images-to-registry.sh --kubeconfig ~/ostest-kubeconfig.yaml --mode full
 ```
-Then delete the failed workspace in the dashboard and create a new one. You can also use `--mirror-from-namespace devworkspace-controller` to auto-discover sha-* images from cluster pods.
+The script also auto-discovers images from cluster events (`Failed` with "manifest unknown") when KUBECONFIG is set. You can also use `--mirror-from-namespace devworkspace-controller` to discover sha-* images from pods.
+Then delete the failed workspace in the dashboard and create a new one.
 
 ## Issue: Node.js/Python devfile server workspaces fail with ImagePullBackOff (registry.access.redhat.com/ubi8)
 
@@ -251,4 +249,7 @@ For a quick fix without other steps, use `--gateway-patch-only`:
 ```bash
 ./scripts/ensure-deployment-ready.sh --kubeconfig ~/ostest-kubeconfig.yaml --gateway-patch-only
 ```
-Then start (or restart) the workspace. The deploy script runs the full fix at the end and re-runs the gateway patch after 20s to catch new workspaces. For workspaces created later, run the script again. The Che routing controller may overwrite the patch on reconcile; if so, run the script and restart the workspace promptly.
+The deploy script also deploys a **CronJob** (`che-gateway-patcher`) that runs every 5 minutes to re-apply the patch when the Che routing controller overwrites it. On IPv6-only clusters, mirror `registry.redhat.io/openshift4/ose-cli` first or the CronJob pod will fail to start. To deploy the CronJob manually:
+```bash
+kubectl apply -f manifests/che/che-gateway-patcher-cronjob.yaml -n eclipse-che
+```

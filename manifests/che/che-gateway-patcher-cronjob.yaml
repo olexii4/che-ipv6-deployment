@@ -1,0 +1,97 @@
+#
+# Copyright (c) 2025-2026 Red Hat, Inc.
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# CronJob that patches workspace Deployments to fix che-gateway runAsNonRoot.
+# The Che routing controller injects che-gateway with runAsNonRoot:true but
+# the Traefik image runs as root. This job runs every 5 minutes to re-apply
+# the patch when the controller overwrites it.
+#
+# Apply with: kubectl apply -f manifests/che/che-gateway-patcher-cronjob.yaml -n eclipse-che
+#
+# For IPv6-only clusters: run the mirror script (ose-cli is included in full mode)
+# or the CronJob pod will fail with ImagePullBackOff.
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: che-gateway-patcher
+  namespace: eclipse-che
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: che-gateway-patcher
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["workspace.devfile.io"]
+    resources: ["devworkspaces"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: che-gateway-patcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: che-gateway-patcher
+subjects:
+  - kind: ServiceAccount
+    name: che-gateway-patcher
+    namespace: eclipse-che
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: che-gateway-patcher
+  namespace: eclipse-che
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: che-gateway-patcher
+          restartPolicy: OnFailure
+          containers:
+            - name: patcher
+              image: registry.redhat.io/openshift4/ose-cli:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -e
+                  PATCHED=0
+                  patch_ns() {
+                    local NS=$1
+                    for DEPLOY in $(oc get deploy -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+                      IDX=0
+                      for CNAME in $(oc get deploy "$DEPLOY" -n "$NS" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null); do
+                        if [ "$CNAME" = "che-gateway" ]; then
+                          CUR=$(oc get deploy "$DEPLOY" -n "$NS" -o jsonpath="{.spec.template.spec.containers[$IDX].securityContext.runAsNonRoot}" 2>/dev/null || echo "")
+                          if [ "$CUR" = "true" ]; then
+                            oc patch deploy "$DEPLOY" -n "$NS" --type=json -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$IDX/securityContext/runAsNonRoot\",\"value\":false}]" 2>/dev/null && PATCHED=$((PATCHED + 1))
+                          fi
+                          break
+                        fi
+                        IDX=$((IDX + 1))
+                      done
+                    done
+                  }
+                  for NS in $(oc get devworkspace -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u); do patch_ns "$NS"; done
+                  for NS in $(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '\-che\-' || true); do patch_ns "$NS"; done
+                  echo "Patched $PATCHED deployment(s)"

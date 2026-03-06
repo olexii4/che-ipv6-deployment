@@ -170,9 +170,9 @@ done
 
 # 4b. Patch workspace Deployments: che-gateway sidecar has runAsNonRoot:true from Che routing controller
 # but the Traefik image runs as root. DevWorkspaceOperatorConfig runAsNonRoot:false doesn't apply to gateway.
-# Directly patch Deployments that have a che-gateway container. Retry a few times (controller may overwrite).
+# Directly patch Deployments that have a che-gateway container. Retry multiple times (controller may overwrite).
 echo "Patching workspace Deployments (che-gateway runAsNonRoot)..."
-for _ in 1 2 3; do
+for _ in 1 2 3 4 5; do
     patch_workspace_gateway_deployments
     sleep 2
 done

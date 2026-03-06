@@ -31,3 +31,7 @@ spec:
   - source: registry.access.redhat.com
     mirrors:
     - virthost.ostest.test.metalkube.org:5000/eclipse-che
+  # Air-gap samples (php, nodejs-express, python) - devspaces/udi-rhel9:3.22
+  - source: registry.redhat.io
+    mirrors:
+    - virthost.ostest.test.metalkube.org:5000/eclipse-che

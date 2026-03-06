@@ -43,3 +43,7 @@ spec:
   - mirrors:
     - ${LOCAL_REGISTRY}/eclipse-che/alpine
     source: docker.io/alpine
+  # Air-gap samples (php, nodejs-express, python) - udi-rhel9:3.22
+  - mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che
+    source: registry.redhat.io

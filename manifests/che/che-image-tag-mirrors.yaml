@@ -43,3 +43,7 @@ spec:
   - source: registry.access.redhat.com
     mirrors:
     - ${LOCAL_REGISTRY}/eclipse-che
+  # Air-gap samples (php, nodejs-express, python) from air-gap-samples.json
+  - source: registry.redhat.io
+    mirrors:
+    - ${LOCAL_REGISTRY}/eclipse-che
