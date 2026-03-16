@@ -60,28 +60,34 @@ cd che-ipv6-deployment
 - Automatically extracts gateway (traefik) image from Che operator bundle
 - Pulls all Che images locally (uses cache for faster re-runs)
 - Pushes images to the cluster's local registry via proxy
-- Creates ImageContentSourcePolicy to redirect image pulls from:
+- Applies ImageTagMirrorSet / ImageDigestMirrorSet (OCP 4.12+) plus legacy ICSP for backward compatibility, redirecting image pulls from:
   - quay.io/eclipse → local registry
   - quay.io/devfile → local registry
   - quay.io/che-incubator → local registry
   - docker.io/library → local registry (for test infrastructure)
   - docker.io/alpine → local registry (for test infrastructure)
   - registry.access.redhat.com → local registry (Node.js, Python devfiles in test-infrastructure)
+- Each `skopeo copy` is guarded by a per-image timeout (`SKOPEO_TIMEOUT_SECONDS`, default 900s) to avoid hangs
 - **Waits for cluster nodes to reboot** (~10-15 minutes)
 
 **Options:**
 ```
---kubeconfig <path>         Path to kubeconfig file (required)
+--kubeconfig <path>         Path to kubeconfig file (required unless --prefetch-only)
 --dashboard-image <image>   Dashboard image (shortcuts: pr-XXXX, next, latest)
 --server-image <image>      Che server image (shortcuts: pr-XXXX, next, latest)
 --mode <minimal|full>       Image set: minimal (Che only) or full (includes DevWorkspace)
 --parallel <N>              Concurrent image copies (default: 1, recommended: 4)
+--prefetch-only             Populate local OCI cache only, no cluster access needed
+--dry-run                   Show what would be mirrored without executing
+--registry <host:port>      Override local registry (default: auto-detect from cluster)
 ```
 
 **After mirroring completes:**
 - All images are available in the local registry
-- Cluster nodes are configured to pull from the mirror
+- Cluster nodes are configured to pull from the mirror (via ITMS/IDMS + ICSP)
 - You can proceed to the next step
+
+**Note:** The cluster is accessible only via the HTTP proxy specified in the kubeconfig (`proxy-url` field). All `oc`/`kubectl` commands automatically use it.
 
 ### 3. Deploy Eclipse Che
 
@@ -109,7 +115,7 @@ cd che-ipv6-deployment
 - Patches images for local registry (fix-image-pulls) - prevents ImagePullBackOff
 - Fixes OAuth redirect URI mismatch (fix-oauth-redirect) - prevents login errors
 - Re-patches DevWorkspace webhook after delay - ensures workspace creation works
-- Runs ensure-deployment-ready - applies SCC fix (anyuid for workspaces), patches che-gateway runAsNonRoot (Traefik runs as root), verifies login and workspace create will work
+- Runs `ensure-deployment-ready` — patches workspace SCC (anyuid), `DevWorkspaceOperatorConfig` (`runAsNonRoot: false`), and workspace Deployments (`che-gateway runAsNonRoot: false` since Traefik runs as root); verifies login and workspace creation will work
 - Adds air-gap samples Secret **after** Che is ready (`--airgap-samples`) - avoids reconcile loop during deploy
 - Optionally deploys devfile HTTP server (`--deploy-devfile-server`) - serves Node.js and Python devfiles over IPv6
 - Waits for all components to be ready
