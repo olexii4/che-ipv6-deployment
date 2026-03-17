@@ -389,16 +389,19 @@ if [ "${MODE}" = "full" ]; then
     # Required by OLM CatalogSource created by chectl (devworkspace-operator-index:next)
     "quay.io/devfile/devworkspace-operator-index:next"
     "quay.io/devfile/devworkspace-controller:next"
-    # Che operator pins devworkspace-webhook to sha-*; mirror so IPv6 cluster can pull
+    # Che operator pins devworkspace-webhook to sha-*; mirror so IPv6 cluster can pull.
+    # Known SHA tags from past bundle versions (keep for cache re-use):
     "quay.io/devfile/devworkspace-controller:sha-9b46583"
     "quay.io/devfile/devworkspace-controller:sha-4410b61"
     "quay.io/devfile/devworkspace-controller:sha-9415b15"
+    "quay.io/devfile/devworkspace-controller:sha-cce29e8"
     "quay.io/devfile/project-clone:next"
     # DWO pins project-clone init container to sha-* (same commit as devworkspace-controller)
     # When adding new devworkspace-controller:sha-*, also add project-clone:sha-* with same tag
     "quay.io/devfile/project-clone:sha-9b46583"
     "quay.io/devfile/project-clone:sha-4410b61"
     "quay.io/devfile/project-clone:sha-9415b15"
+    "quay.io/devfile/project-clone:sha-cce29e8"
     "quay.io/devfile/universal-developer-image:ubi9-latest"
     # Default editor (CheCluster defaultEditor: che-incubator/che-code/latest)
     "quay.io/che-incubator/che-code:latest"
@@ -426,6 +429,56 @@ if [ "${MODE}" = "full" ]; then
     "registry.redhat.io/openshift4/ose-cli:latest"
   )
 fi
+fi
+
+# Dynamically discover the SHA tags used by the current DWO bundle.
+#
+# Problem: The DWO bundle pins devworkspace-webhook-server and project-clone to a specific
+# sha-* tag. The static list above covers known historical tags, but becomes stale after
+# any bundle update. Without the exact SHA in the local registry:
+#   - devworkspace-webhook-server stays in ImagePullBackOff (DWO reconciles it back to SHA)
+#   - workspace init container project-clone also fails with ImagePullBackOff
+#
+# This step pulls the DWO bundle image, inspects the CSV, and adds any sha-* tags found
+# in image references so they are mirrored automatically on every run.
+if [ "${MODE}" = "full" ] && [ "${PREFETCH_ONLY}" != "true" ] && command -v podman &>/dev/null; then
+  echo -e "${YELLOW}Discovering SHA tags from DWO bundle (auto-update static list)...${NC}"
+  _DWO_BUNDLE="${DEVWORKSPACE_BUNDLE_IMAGE:-quay.io/devfile/devworkspace-operator-bundle:next}"
+  # Use a temp dir so we don't pollute the caller's environment
+  _DWO_TMP=$(mktemp -d)
+  _DWO_SHA_TAGS=()
+  if podman pull --quiet "${_DWO_BUNDLE}" >/dev/null 2>&1; then
+    _DWO_CTR=$(podman create "${_DWO_BUNDLE}" 2>/dev/null)
+    if podman cp "${_DWO_CTR}:/manifests" "${_DWO_TMP}/manifests" 2>/dev/null; then
+      _DWO_CSV=$(find "${_DWO_TMP}/manifests" -name "*.clusterserviceversion.yaml" | head -1)
+      if [ -n "${_DWO_CSV}" ]; then
+        while IFS= read -r sha; do
+          [ -z "${sha}" ] && continue
+          _DWO_SHA_TAGS+=("${sha}")
+        done < <(grep -oE 'sha-[a-f0-9]+' "${_DWO_CSV}" 2>/dev/null | sort -u)
+      fi
+    fi
+    podman rm "${_DWO_CTR}" >/dev/null 2>&1 || true
+  else
+    echo -e "${YELLOW}  ⚠ Could not pull DWO bundle for SHA discovery (non-fatal)${NC}"
+  fi
+  rm -rf "${_DWO_TMP}"
+
+  if [ "${#_DWO_SHA_TAGS[@]}" -gt 0 ]; then
+    echo "  Discovered DWO SHA tags: ${_DWO_SHA_TAGS[*]}"
+    for _sha in "${_DWO_SHA_TAGS[@]}"; do
+      for _img in "quay.io/devfile/devworkspace-controller" "quay.io/devfile/project-clone"; do
+        _tagged="${_img}:${_sha}"
+        if ! printf '%s\n' "${IMAGES[@]}" | grep -Fxq "${_tagged}" 2>/dev/null; then
+          echo "  + Adding discovered image: ${_tagged}"
+          IMAGES+=("${_tagged}")
+        fi
+      done
+    done
+  else
+    echo "  No new SHA tags discovered from bundle"
+  fi
+  echo ""
 fi
 
 # Optionally discover additional images from namespaces (helps when operators pin sha-* tags/digests).

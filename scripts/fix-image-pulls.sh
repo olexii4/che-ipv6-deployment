@@ -61,11 +61,20 @@ if [ -z "$REGISTRY" ]; then
 fi
 echo "Using registry: $REGISTRY"
 
-# Apply ImageTagMirrorSet if che-image-mirrors exists (with registry substitution)
+# Apply ImageTagMirrorSet only if it does not exist yet.
+# Re-applying an ITMS (even unchanged) can trigger a MachineConfigPool rollout
+# which reboots cluster nodes. The proxy used by kubectl runs on a node, so a reboot
+# severs the connection and makes the cluster appear unavailable.
+# mirror-images-to-registry.sh applies the ITMS once at initial setup; skip here.
 MIRRORS_YAML="${REPO_ROOT}/manifests/che/che-image-mirrors.yaml"
 if [ -f "$MIRRORS_YAML" ]; then
-  echo "Applying ImageTagMirrorSet..."
-  sed "s|virthost.ostest.test.metalkube.org:5000|${REGISTRY}|g" "$MIRRORS_YAML" | oc apply -f -
+  ITMS_NAME=$(grep -m1 'name:' "$MIRRORS_YAML" | awk '{print $2}' || echo "che-eclipse-mirror")
+  if oc get imagetagmirrorset "${ITMS_NAME}" &>/dev/null 2>&1; then
+    echo "ImageTagMirrorSet '${ITMS_NAME}' already exists — skipping apply (avoids node reboots)"
+  else
+    echo "Applying ImageTagMirrorSet '${ITMS_NAME}'..."
+    sed "s|virthost.ostest.test.metalkube.org:5000|${REGISTRY}|g" "$MIRRORS_YAML" | oc apply -f -
+  fi
 fi
 
 echo "Patching che-operator..."
@@ -92,6 +101,96 @@ for i in 1 2 3 4 5 6; do
   fi
   [ $i -lt 6 ] && sleep 5
 done
+
+# Ensure the exact SHA tag used by the DWO bundle is available in the local registry.
+#
+# Problem: DWO controller-manager reconciles devworkspace-webhook-server back to its original
+# image tag (e.g. quay.io/devfile/devworkspace-controller:sha-cce29e8). If that SHA tag is not
+# in the local registry, the webhook pod stays in ImagePullBackOff and workspace creation fails
+# with "no endpoints available for service devworkspace-webhookserver".
+#
+# Solution: read the SHA tag from the bundle-deployed deployment, then re-tag :next as that SHA
+# in the local registry using skopeo on a cluster node (nodes have direct registry access).
+# Also handles project-clone - DWO injects it as an init container using the same SHA tag.
+ensure_sha_tags_in_registry() {
+  local registry="${1}"
+
+  # Read the image tag the DWO bundle set (e.g. quay.io/devfile/devworkspace-controller:sha-cce29e8)
+  local bundle_image
+  bundle_image=$(oc get deployment devworkspace-webhook-server -n devworkspace-controller \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+  local sha_tag
+  sha_tag=$(echo "${bundle_image}" | grep -oE 'sha-[a-f0-9]+$' || echo "")
+
+  if [ -z "${sha_tag}" ]; then
+    echo "  No sha-* tag detected in webhook deployment image (image: ${bundle_image}), skipping re-tag"
+    return 0
+  fi
+
+  echo "  Detected DWO SHA tag: ${sha_tag}"
+
+  # Pick a ready node to run skopeo on
+  local node
+  node=$(oc get nodes --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | head -1)
+  if [ -z "${node}" ]; then
+    echo "  WARN: no cluster node found - cannot re-tag SHA images. Run mirror-images-to-registry.sh with --mode full."
+    return 0
+  fi
+
+  # Re-tag :next as :sha-xxx for both devworkspace-controller and project-clone.
+  # project-clone is injected by DWO as an init container using the same SHA tag.
+  local images=("devfile/devworkspace-controller" "devfile/project-clone")
+  for img_path in "${images[@]}"; do
+    local src="${registry}/eclipse-che/${img_path}:next"
+    local dst="${registry}/eclipse-che/${img_path}:${sha_tag}"
+    echo "  Re-tagging ${img_path}:${sha_tag} in local registry (via node ${node})..."
+    if oc debug "node/${node}" --quiet -- chroot /host \
+        skopeo copy --dest-tls-verify=false --src-tls-verify=false \
+        "docker://${src}" "docker://${dst}" 2>/dev/null; then
+      echo "    OK: ${img_path}:${sha_tag}"
+    else
+      # Fallback: podman pull + tag + push (available on all OpenShift nodes)
+      oc debug "node/${node}" --quiet -- chroot /host bash -c \
+        "podman pull --tls-verify=false '${src}' \
+         && podman tag '${src}' '${dst}' \
+         && podman push --tls-verify=false '${dst}'" 2>/dev/null \
+        && echo "    OK (podman fallback): ${img_path}:${sha_tag}" \
+        || echo "    WARN: re-tag failed for ${img_path}:${sha_tag}. Run mirror-images-to-registry.sh to add it manually."
+    fi
+  done
+}
+
+# Temporarily set DWO MutatingWebhookConfiguration to failurePolicy: Ignore.
+# When devworkspace-webhook-server is in ImagePullBackOff (no endpoints), the webhook
+# blocks ALL admission requests for matched resources. With failurePolicy: Fail this
+# can cascade: oc debug node (needed for re-tag) creates a pod that the webhook tries
+# to intercept, fails, and the re-tag never runs. Setting Ignore lets pods through
+# while we fix the image; DWO controller-manager reconciles it back to Fail once healthy.
+DWO_MWC_NAME=$(oc get mutatingwebhookconfiguration -o name 2>/dev/null | grep devworkspace | head -1 || echo "")
+if [ -n "$DWO_MWC_NAME" ]; then
+  echo "Patching DWO MutatingWebhookConfiguration to failurePolicy: Ignore (temporary)..."
+  oc patch "${DWO_MWC_NAME}" --type='json' \
+    -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"},{"op":"replace","path":"/webhooks/1/failurePolicy","value":"Ignore"}]' \
+    2>/dev/null || \
+  oc patch "${DWO_MWC_NAME}" --type='json' \
+    -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]' \
+    2>/dev/null || true
+fi
+
+echo "Ensuring DWO SHA tags are available in local registry..."
+ensure_sha_tags_in_registry "${REGISTRY}"
+
+# Restore DWO MutatingWebhookConfiguration to failurePolicy: Fail.
+# DWO controller-manager will also reconcile this back automatically once healthy.
+if [ -n "$DWO_MWC_NAME" ]; then
+  echo "Restoring DWO MutatingWebhookConfiguration to failurePolicy: Fail..."
+  oc patch "${DWO_MWC_NAME}" --type='json' \
+    -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Fail"},{"op":"replace","path":"/webhooks/1/failurePolicy","value":"Fail"}]' \
+    2>/dev/null || \
+  oc patch "${DWO_MWC_NAME}" --type='json' \
+    -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Fail"}]' \
+    2>/dev/null || true
+fi
 
 # Delete failed DWO pods to trigger repull (critical for workspace creation - webhook must have endpoints)
 echo "Deleting failed DevWorkspace Operator pods to trigger repull..."

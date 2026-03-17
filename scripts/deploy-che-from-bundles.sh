@@ -232,6 +232,61 @@ if [ "$SKIP_DEVWORKSPACE" = false ]; then
         envsubst < "${MANIFEST_DIR}/che/dwo-fallback.yaml" > "$TEMP_DIR/dwo-deployment.yaml"
     fi
 
+    # Ensure SHA-pinned DWO images are available in the local registry BEFORE applying manifests.
+    #
+    # The DWO bundle pins devworkspace-webhook-server and project-clone init containers to a
+    # specific sha-* tag (e.g. sha-cce29e8). The mirror script has a static list of known SHA
+    # tags that goes stale with every bundle update. If the exact SHA is missing:
+    #   - devworkspace-webhook-server enters ImagePullBackOff immediately on creation
+    #   - MutatingWebhookConfiguration failurePolicy:Fail blocks admission for matched resources
+    #   - workspace creation fails: "no endpoints available for devworkspace-webhookserver"
+    #   - workspace init container fails: "project-clone ImagePullBackOff"
+    #
+    # Fix: extract the actual SHA from the CSV *before* applying manifests, then re-tag :next
+    # as :sha-xxx in the local registry using skopeo on a cluster node. Nodes have direct
+    # access to the local registry without the external proxy.
+    DWO_SHA_TAG=""
+    if command -v yq &>/dev/null && ! yq --help 2>&1 | grep -q "jq wrapper"; then
+        DWO_SHA_TAG=$(yq eval '.spec.install.spec.deployments[] | select(.name == "devworkspace-webhook-server") | .spec.template.spec.containers[0].image' "$CSV_FILE" 2>/dev/null \
+            | grep -oE 'sha-[a-f0-9]+' | head -1 || echo "")
+        if [ -z "$DWO_SHA_TAG" ]; then
+            DWO_SHA_TAG=$(grep -oE 'devworkspace-controller:sha-[a-f0-9]+' "$CSV_FILE" 2>/dev/null \
+                | head -1 | grep -oE 'sha-[a-f0-9]+' || echo "")
+        fi
+    else
+        DWO_SHA_TAG=$(grep -oE 'devworkspace-controller:sha-[a-f0-9]+' "$CSV_FILE" 2>/dev/null \
+            | head -1 | grep -oE 'sha-[a-f0-9]+' || echo "")
+    fi
+
+    if [ -n "$DWO_SHA_TAG" ]; then
+        log_info "DWO bundle uses SHA tag: ${DWO_SHA_TAG} — ensuring it is in local registry before deploy..."
+        DWO_REGISTRY=$(oc get imagetagmirrorset -o jsonpath='{.items[0].spec.imageTagMirrors[0].mirrors[0]}' 2>/dev/null | sed 's|/.*||' \
+            || oc get imagecontentsourcepolicy -o jsonpath='{.items[0].spec.repositoryDigestMirrors[0].mirrors[0]}' 2>/dev/null | sed 's|/.*||' \
+            || echo "virthost.ostest.test.metalkube.org:5000")
+        DWO_NODE=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | head -1)
+        if [ -n "$DWO_NODE" ]; then
+            for img_path in "devfile/devworkspace-controller" "devfile/project-clone"; do
+                src="${DWO_REGISTRY}/eclipse-che/${img_path}:next"
+                dst="${DWO_REGISTRY}/eclipse-che/${img_path}:${DWO_SHA_TAG}"
+                log_info "  Re-tagging ${img_path}:${DWO_SHA_TAG} via node ${DWO_NODE}..."
+                if oc debug "node/${DWO_NODE}" --quiet -- chroot /host \
+                    skopeo copy --dest-tls-verify=false --src-tls-verify=false \
+                    "docker://${src}" "docker://${dst}" 2>/dev/null; then
+                    log_success "  ${img_path}:${DWO_SHA_TAG} ready in local registry"
+                else
+                    oc debug "node/${DWO_NODE}" --quiet -- chroot /host bash -c \
+                        "podman pull --tls-verify=false '${src}' && podman tag '${src}' '${dst}' && podman push --tls-verify=false '${dst}'" 2>/dev/null \
+                        && log_success "  ${img_path}:${DWO_SHA_TAG} ready (podman fallback)" \
+                        || log_warn "  Re-tag failed for ${img_path}:${DWO_SHA_TAG}. Run mirror-images-to-registry.sh --mode full if webhook/workspace pods fail."
+                fi
+            done
+        else
+            log_warn "No cluster node found for pre-deploy re-tag. Webhook pods may enter ImagePullBackOff."
+        fi
+    else
+        log_warn "Could not detect DWO SHA tag from CSV — webhook may fail if SHA tag is not in local registry."
+    fi
+
     # Apply manifests
     log_info "Applying DevWorkspace Operator manifests..."
     if [ -f "$TEMP_DIR/dwo-rbac.yaml" ]; then
